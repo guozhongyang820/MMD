@@ -214,7 +214,7 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
         else:
             mp = N("ShaderNodeMapping")
             sx, sy = image["size"]
-            mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1)
+            mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1 / sx if image.get("box") else 1)
             mp.inputs["Rotation"].default_value = (0, 0, math.radians(image.get("rot", 0)))
             if image.get("plane", "XY") != "XY":        # 墙面：W = (x+y, z)，WN = (x−y, z)，CYL = (角度·半径, z)
                 L(_coords(nt, image["plane"], image.get("radius", 1.0)), mp.inputs["Vector"])
@@ -224,6 +224,9 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
         it = N("ShaderNodeTexImage")
         it.image = image["color"]
         it.interpolation = "Cubic"
+        if image.get("box"):                            # 六面投影（树篱、灌木、草地这类任意朝向的形体）
+            it.projection = "BOX"
+            it.projection_blend = 0.3
         L(uv, it.inputs["Vector"])
         base = it.outputs["Color"]
         if image.get("tint"):
@@ -233,6 +236,9 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
         if image.get("height"):
             ht = N("ShaderNodeTexImage")
             ht.image = image["height"]
+            if image.get("box"):
+                ht.projection = "BOX"
+                ht.projection_blend = 0.3
             L(uv, ht.inputs["Vector"])
             bp = N("ShaderNodeBump")
             bp.inputs["Strength"].default_value = image.get("bump", 0.6)
@@ -411,15 +417,32 @@ class Mats:
         self.banner = toon("蓝色旗幡", "#63B7EE", sheen=("#C8ECFF", 0.8), alpha=0.9)
         self.copper = toon("铜顶", "#B98A5A", sheen=("#E6C39A", 0.5))
         # 植物
-        self.grass = toon("草地", "#78C03E")
-        self.hedge = toon("树篱", "#4FA23A")
-        self.hedge_dark = toon("树篱_暗", "#3C8A33")
-        self.flower = toon("黄花", "#F7C624")
+        # 植物：叶片贴图（程序生成）+ 散布的叶片 / 花 / 草叶几何
+        fc_, fh_ = cached(gen_foliage)
+        gc_, gh_ = cached(gen_foliage, count=4200, length=(0.06, 0.14), ratio=0.16, bg="#4A8F2A",
+                          palette=("#5FA935", "#6DB83B", "#7FC744", "#94D24F"), seed=4)
+        self.plant_tex = [make_image("叶片_颜色", fc_), make_image("叶片_高度", fh_, True),
+                          make_image("草地_颜色", gc_), make_image("草地_高度", gh_, True)]
+        self.hedge = toon("树篱", "#4FA23A", image=dict(color=self.plant_tex[0], height=self.plant_tex[1],
+                                                       size=(1.2, 1.2), box=True, bump=0.8))
+        self.hedge_dark = toon("树篱_暗", "#3C8A33", image=dict(color=self.plant_tex[0], height=self.plant_tex[1],
+                                                             size=(1.2, 1.2), box=True, bump=0.8,
+                                                             tint=(0.75, 0.8, 0.75)))
+        self.grass = toon("草地", "#78C03E", image=dict(color=self.plant_tex[2], height=self.plant_tex[3],
+                                                       size=(1.5, 1.5), box=True, bump=0.5))
+        self.leaves = [toon("叶片_%d" % i, c) for i, c in enumerate(("#3F8A2C", "#52A236", "#66B63F", "#7FC64B"))]
+        self.blades = [toon("草叶_%d" % i, c) for i, c in enumerate(("#5FA935", "#72BC3E", "#8BCB4B"))]
+        self.flower = toon("黄花", "#F9C42A")
+        self.flower_deep = toon("黄花_深", "#F0A21C")
+        self.flower_eye = toon("花心", "#E0781E")
         self.flower_white = toon("白花", "#F5F2E6")
-        self.cypress = toon("柏树", "#1E9B7F")
-        self.cypress_dark = toon("柏树_暗", "#12705F")
-        self.bark = toon("树干", "#8A5A3A")
-        self.pot = toon("花盆", "#E5DDD0")
+        self.petal_cream = toon("乳白花瓣", "#F3EDD6")
+        self.cypress = toon("柏树", "#1C8C74")
+        self.cypress_light = toon("柏树_亮", "#28A88A")
+        self.cypress_dark = toon("柏树_暗", "#0F5E50")
+        self.bark = toon("树干", "#7A5238")
+        self.pot = toon("花盆", "#DAD6CF")
+        self.soil = toon("盆土", "#3A2A22")
         self.lamp_glass = toon("灯罩", "#EAF6F0", emit=0.3)
 
 
@@ -635,6 +658,48 @@ def gen_ashlar(n=2048, W=8.0, H=4.0, rows=(0.42, 0.6), widths=(0.55, 1.35), base
     col = col * (1 - jn[..., None]) + _hex2rgb(joint) * jn[..., None]
     height = (0.2 + 0.8 * b ** 0.5) * (1 - jn)
     return np.clip(col, 0, 1), np.clip(height, 0, 1)
+
+
+def gen_foliage(n=1024, count=2600, length=(0.05, 0.11), ratio=0.42, bg="#2E6B22",
+                palette=("#3F8A2C", "#4E9E34", "#5DAE3A", "#6FBE43", "#86CC4E"), seed=3):
+    """
+    无缝叶片贴图：在深色底上一层层叠几千片尖头叶子（随机方向、大小、颜色，叶尖亮叶根暗，
+    带叶脉和深色描边），再输出高度图。length 是叶长占贴图边长的比例，ratio = 叶宽 / 叶长。
+    """
+    rng = np.random.RandomState(seed)
+    col = np.tile(_hex2rgb(bg), (n, n, 1)) * (1 + 0.08 * _lowfreq_noise(*np.meshgrid(
+        np.arange(n) / n, np.arange(n) / n), seed)[..., None])
+    hgt = np.zeros((n, n))
+    pal = [_hex2rgb(c) for c in palette]
+    for _ in range(count):
+        L = rng.uniform(*length) * n
+        W = L * ratio * rng.uniform(0.8, 1.2)
+        cx, cy = rng.uniform(0, n, 2)
+        a = rng.uniform(0, math.tau)
+        R = int(L / 2 + 3)
+        ix = (np.arange(int(cx) - R, int(cx) + R + 1)) % n
+        iy = (np.arange(int(cy) - R, int(cy) + R + 1)) % n
+        X, Y = np.meshgrid(np.arange(int(cx) - R, int(cx) + R + 1) - cx, np.arange(int(cy) - R, int(cy) + R + 1) - cy)
+        u = X * math.cos(a) + Y * math.sin(a)
+        v = -X * math.sin(a) + Y * math.cos(a)
+        t = np.clip(2 * u / L, -1, 1)
+        half = W / 2 * (1 - t ** 2)
+        d = half - np.abs(v)                              # >0 在叶内
+        inside = (np.abs(2 * u / L) < 1) & (d > -1)
+        if not inside.any():
+            continue
+        cov = np.clip(d + 0.5, 0, 1) * inside
+        base = pal[rng.randint(len(pal))] * rng.uniform(0.9, 1.1)
+        shade = (0.78 + 0.32 * (t + 1) / 2)[..., None]    # 叶根暗、叶尖亮
+        c = base * shade
+        c = c * np.where(np.abs(v) < 0.7, 0.85, 1.0)[..., None]                   # 叶脉
+        c = c * np.where(d < 1.2, 0.72, 1.0)[..., None]                           # 描边
+        sub_c = col[np.ix_(iy, ix)]
+        col[np.ix_(iy, ix)] = sub_c * (1 - cov[..., None]) + c * cov[..., None]
+        hh = np.clip(d / max(W / 2, 1), 0, 1) ** 0.5
+        sub_h = hgt[np.ix_(iy, ix)]
+        hgt[np.ix_(iy, ix)] = np.where(cov > 0.5, 0.4 + 0.6 * hh, sub_h)
+    return np.clip(col, 0, 1), np.clip(hgt, 0, 1)
 
 
 TEX_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "fontaine_furina_tex")
@@ -1533,17 +1598,168 @@ def build_building(M, root):
 
 
 def flower_pot(P, M, x, y, z):
-    P.lathe((x, y, z), [(0.28, 0.0), (0.34, 0.08), (0.24, 0.16), (0.2, 0.3), (0.3, 0.42), (0.52, 0.62),
-                        (0.56, 0.72), (0.5, 0.74), (0.45, 0.68), (0.0, 0.68)], M.pot, seg=24)
-    for i in range(9):
-        a = RNG.uniform(0, math.tau)
-        r = RNG.uniform(0.0, 0.3)
-        tip = Vector((x + math.cos(a) * r * 1.4, y + math.sin(a) * r * 1.4, z + RNG.uniform(1.0, 1.45)))
-        P.beam((x + math.cos(a) * r * 0.5, y + math.sin(a) * r * 0.5, z + 0.65), tip, 0.03, 0.03, M.hedge)
-        P.ico(tip, 0.09, M.flower_white if i % 3 else M.flower, sub=1)
-        for k in range(3):
-            P.ico(tip + Vector((RNG.uniform(-0.15, 0.15), RNG.uniform(-0.15, 0.15), -0.25 - k * 0.12)),
-                  0.1, M.hedge, scale=(1.4, 0.6, 0.3), sub=1)
+    """
+    门口石花盆（参考截图 25）：十二棱石座 → 十二棱外敞盆身（腰上两道凸环夹交叉斜纹）→ 盆沿 → 深色土，
+    里面一丛带对生长叶的茎，顶上开乳白尖瓣花、橙红花心
+    """
+    rng = random.Random(int(abs(x * 13 + y * 7)))
+    seg = 12
+    P.lathe((x, y, z), [(0.5, 0.0), (0.5, 0.08), (0.46, 0.13), (0.42, 0.13), (0.42, 0.15), (0.0, 0.15)],
+            M.pot, seg=seg, smooth=False)
+    prof = [(0.3, 0.15), (0.33, 0.2), (0.4, 0.34), (0.47, 0.5), (0.52, 0.62), (0.55, 0.66), (0.55, 0.72),
+            (0.49, 0.72), (0.45, 0.66), (0.0, 0.66)]
+    P.lathe((x, y, z), prof, M.pot, seg=seg, smooth=False)
+    P.lathe((x, y, z), [(0.46, 0.66), (0.46, 0.68), (0.0, 0.68)], M.soil, seg=seg, smooth=False)
+    r_at = lambda h: 0.4 + (0.47 - 0.4) * (h - 0.34) / 0.16
+    for h in (0.33, 0.51):                              # 两道凸环
+        P.lathe((x, y, z), [(r_at(h) - 0.01, h - 0.02), (r_at(h) + 0.025, h - 0.015), (r_at(h) + 0.025, h + 0.015),
+                            (r_at(h) - 0.01, h + 0.02)], M.pot, seg=seg, smooth=False)
+    for k in range(seg):                                # 交叉斜纹
+        a0, a1 = k / seg * math.tau, (k + 1) / seg * math.tau
+        for (h0, aa), (h1, bb) in (((0.36, a0), (0.48, a1)), ((0.36, a1), (0.48, a0))):
+            P.beam((x + math.cos(aa) * (r_at(h0) + 0.012), y + math.sin(aa) * (r_at(h0) + 0.012), z + h0),
+                   (x + math.cos(bb) * (r_at(h1) + 0.012), y + math.sin(bb) * (r_at(h1) + 0.012), z + h1),
+                   0.018, 0.012, M.pot)
+    # 植物
+    zs = z + 0.68
+    for k in range(6):
+        a = k / 6 * math.tau + rng.uniform(-0.3, 0.3)
+        r0 = rng.uniform(0.05, 0.22)
+        base = Vector((x + math.cos(a) * r0, y + math.sin(a) * r0, zs))
+        h = rng.uniform(0.45, 0.95)
+        lean = Vector((math.cos(a), math.sin(a), 0)) * rng.uniform(0.08, 0.25)
+        pts = [base + lean * (t ** 1.5) + Vector((0, 0, h * t)) for t in (0.0, 0.35, 0.7, 1.0)]
+        for q0, q1 in zip(pts, pts[1:]):
+            P.beam(q0, q1, 0.018, 0.018, M.leaves[1])
+        for t in (0.2, 0.4, 0.6, 0.8):                  # 对生长叶
+            q = base + lean * (t ** 1.5) + Vector((0, 0, h * t))
+            b = rng.uniform(0, math.tau)
+            for s_ in (0, math.pi):
+                d = Vector((math.cos(b + s_), math.sin(b + s_), rng.uniform(0.2, 0.7))).normalized()
+                leaf_card(P, q, d, rng.uniform(0.12, 0.18), 0.35, rng.choice(M.leaves[1:]), rng)
+        if k < 5:
+            tip = pts[-1]
+            petal_flower(P, tip, Vector((lean.x * 2, lean.y * 2, 1)).normalized(), rng.uniform(0.09, 0.13),
+                         M.petal_cream, M.flower_eye, rng, n_pet=8, cup=0.6)
+        else:
+            P.ico(pts[-1], 0.035, M.petal_cream, scale=(1, 1, 1.5), sub=1)
+
+
+def _frame(n):
+    """法线 n → 两个切向量"""
+    n = Vector(n).normalized()
+    t = n.cross(Vector((0, 0, 1)) if abs(n.z) < 0.95 else Vector((1, 0, 0))).normalized()
+    return t, n.cross(t).normalized()
+
+
+def leaf_card(P, base, d, L, ratio, mat, rng, twist=None):
+    """尖头叶片（6 个顶点的菱形），从 base 沿方向 d 伸出 L 米"""
+    d = Vector(d).normalized()
+    s1, _ = _frame(d)
+    if twist is None:
+        twist = rng.uniform(-0.6, 0.6)
+    side = (s1 * math.cos(twist) + d.cross(s1) * math.sin(twist)) * (L * ratio / 2)
+    bm = P.bm
+    b = Vector(base)
+    vs = [bm.verts.new(v) for v in (b, b + d * L * 0.3 + side, b + d * L * 0.7 + side * 0.7, b + d * L,
+                                    b + d * L * 0.7 - side * 0.7, b + d * L * 0.3 - side)]
+    P._tag_faces([bm.faces.new(vs)], mat)
+
+
+def petal_flower(P, c, n, r, petal_mat, eye_mat, rng, n_pet=5, cup=0.25):
+    """星形小花：n_pet 片尖花瓣 + 花心，朝向法线 n，cup = 花瓣向上翘的程度"""
+    t1, t2 = _frame(n)
+    n = Vector(n).normalized()
+    c = Vector(c)
+    bm = P.bm
+    a0 = rng.uniform(0, math.tau)
+    faces = []
+    for k in range(n_pet):
+        a = a0 + k / n_pet * math.tau
+        w = math.pi / n_pet * 0.75
+        dir_ = lambda ang, rr, lift: c + (t1 * math.cos(ang) + t2 * math.sin(ang)) * rr + n * lift
+        faces.append(bm.faces.new([bm.verts.new(v) for v in (
+            c + n * 0.005, dir_(a - w, r * 0.5, r * cup * 0.35), dir_(a, r, r * cup), dir_(a + w, r * 0.5, r * cup * 0.35))]))
+    P._tag_faces(faces, petal_mat)
+    P.ico(c + n * r * 0.12, r * 0.22, eye_mat, sub=1)
+
+
+def grass_tuft(P, p, rng, mats, h=(0.18, 0.38)):
+    """一簇 3~4 根弯曲的草叶"""
+    bm = P.bm
+    faces = []
+    for _ in range(rng.randint(3, 4)):
+        a = rng.uniform(0, math.tau)
+        lean = Vector((math.cos(a), math.sin(a), 0))
+        side = Vector((-math.sin(a), math.cos(a), 0)) * rng.uniform(0.018, 0.03)
+        hh = rng.uniform(*h)
+        bend = rng.uniform(0.05, 0.18)
+        b = Vector(p) + lean * rng.uniform(0, 0.04)
+        m = b + Vector((0, 0, hh * 0.55)) + lean * bend * 0.3
+        t = b + Vector((0, 0, hh)) + lean * bend
+        faces.append(bm.faces.new([bm.verts.new(v) for v in (b - side, b + side, m + side * 0.6, t, m - side * 0.6)]))
+        P._tag_faces([faces[-1]], rng.choice(mats))
+
+
+def bell_flower(P, M, p, rng):
+    """草地里垂头的小白花：细茎 + 朝下的小钟形"""
+    h = rng.uniform(0.25, 0.45)
+    a = rng.uniform(0, math.tau)
+    top = Vector(p) + Vector((math.cos(a) * 0.06, math.sin(a) * 0.06, h))
+    P.beam(p, top, 0.012, 0.012, M.blades[0])
+    P.cyl(top - Vector((math.cos(a) * -0.03, math.sin(a) * -0.03, 0.04)), 0.045, 0.07, M.flower_white, seg=6,
+          r2=0.015, smooth=False)
+
+
+def scatter_points(ob, density, rng, min_nz=-1.0):
+    """在对象（含修改器后的）表面按面积随机撒点 → [(位置, 法线)]"""
+    bpy.context.view_layer.update()
+    dg = bpy.context.evaluated_depsgraph_get()
+    oe = ob.evaluated_get(dg)
+    me = oe.to_mesh()
+    me.calc_loop_triangles()
+    mw = ob.matrix_world
+    rot = mw.to_3x3()
+    out = []
+    vs = me.vertices
+    for tri in me.loop_triangles:
+        nrm = (rot @ tri.normal).normalized()
+        if nrm.z < min_nz:
+            continue
+        cnt = density * tri.area
+        k = int(cnt) + (1 if rng.random() < cnt - int(cnt) else 0)
+        a, b, c = (vs[i].co for i in tri.vertices)
+        for _ in range(k):
+            u, v = rng.random(), rng.random()
+            if u + v > 1:
+                u, v = 1 - u, 1 - v
+            out.append((mw @ (a + (b - a) * u + (c - a) * v), nrm))
+    oe.to_mesh_clear()
+    return out
+
+
+def leaf_skin(ob, C, M, density=90, seed=1):
+    """给树篱 / 灌木表面撒一层外翻的叶片，让轮廓毛茸茸（参考截图 26）"""
+    rng = random.Random(seed)
+    P = Part(ob.name + "_叶片", C)
+    for p, n in scatter_points(ob, density, rng, min_nz=-0.4):
+        t1, t2 = _frame(n)
+        a = rng.uniform(0, math.tau)
+        d = (n * rng.uniform(0.3, 0.8) + (t1 * math.cos(a) + t2 * math.sin(a))).normalized()
+        leaf_card(P, p - n * 0.03, d, rng.uniform(0.1, 0.17), 0.45, rng.choice(M.leaves), rng)
+    return P.finish()
+
+
+def grass_skin(ob, C, M, density=30, flowers=1.2, seed=2):
+    """草地顶面撒草叶簇和垂头小白花"""
+    rng = random.Random(seed)
+    P = Part(ob.name + "_草叶", C)
+    for p, n in scatter_points(ob, density, rng, min_nz=0.7):
+        grass_tuft(P, p, rng, M.blades)
+    if flowers:
+        for p, n in scatter_points(ob, flowers, rng, min_nz=0.7):
+            bell_flower(P, M, p, rng)
+    return P.finish()
 
 
 # ===========================================================================
@@ -1761,12 +1977,12 @@ def build_stairs(M, root):
     xg = GARDEN[0]
     slope_prism(P, STAIR_X0 - 4.0, xg, STAIR_Y1 + 0.4, STAIR_Y1 + 3.5, 0.0, GARDEN_Z + 0.25, 0.0,
                 max(GARDEN_Z, stair_line(xg) + 0.85), M.grass)
-    P.finish()
+    grass_skin(P.finish(), C, M, seed=11)
     P = Part("台阶旁树篱", C)
     slope_prism(P, STAIR_X0 - 4.5, xg, STAIR_Y1 + 0.5, STAIR_Y1 + 1.3, GARDEN_Z + 0.2, GARDEN_Z + 0.95,
                 stair_line(xg) + 0.8, stair_line(xg) + 1.6, M.hedge)
-    P.modifiers.append(organic(0.25, 0.1, 0.6))
-    P.finish()
+    P.modifiers.append(organic(0.25, 0.06, 0.6))
+    leaf_skin(P.finish(), C, M, seed=12)
 
 
 def build_garden(M, root):
@@ -1783,7 +1999,7 @@ def build_garden(M, root):
 
     P = Part("草地", C)
     P.box_mm(gx0 + 0.4, gx1 - 0.4, gy0 + 0.4, gy1 - 0.4, GARDEN_Z, GARDEN_Z + 0.25, M.grass)
-    P.finish()
+    grass_skin(P.finish(), C, M, seed=13)
 
     # 修剪树篱（圆角 + 噪声置换，看起来像植物）
     P = Part("树篱", C)
@@ -1794,8 +2010,8 @@ def build_garden(M, root):
               ((gx0 + 3.0, gx0 + 4.0, gy0 + 5.0, gy1 - 2.0), 0.8)]
     for (x0, x1, y0, y1), h in hedges:
         P.box_mm(x0, x1, y0, y1, zt, zt + h, M.hedge)
-    P.modifiers.append(organic(0.25, 0.12, 0.6))
-    P.finish()
+    P.modifiers.append(organic(0.25, 0.06, 0.6))
+    leaf_skin(P.finish(), C, M, seed=14)
 
     P = Part("黄花丛", C)
     for x, y, r in ((gx1 - 1.2, gy0 + 1.3, 1.1), (gx0 + 5.0, gy0 + 1.2, 1.0), (gx1 - 1.3, gy0 + 6.0, 1.0),
@@ -1819,9 +2035,11 @@ def build_garden(M, root):
     P.finish()
     P = Part("右侧花坛_植物", C)
     P.box_mm(STAIR_X1 + 0.3, STAIR_X0 + 0.6, STAIR_Y0 - 8.7, STAIR_Y0 - 0.8, H, H + 0.2, M.grass)
+    grass_skin(P.finish(), C, M, flowers=0.6, seed=15)
+    P = Part("右侧花坛_树篱", C)
     P.box_mm(STAIR_X1 + 0.5, STAIR_X0 + 0.4, STAIR_Y0 - 2.2, STAIR_Y0 - 0.9, H + 0.2, H + 1.0, M.hedge)
-    P.modifiers.append(organic(0.2, 0.1, 0.6))
-    P.finish()
+    P.modifiers.append(organic(0.2, 0.06, 0.6))
+    leaf_skin(P.finish(), C, M, seed=16)
     P = Part("右侧花坛_花", C)
     for x in (STAIR_X0 - 1.5, STAIR_X0 - 7.0, STAIR_X0 - 12.0):
         flower_bush(P, M, x, STAIR_Y0 - 1.6, H + 0.9, 0.8)
@@ -1847,30 +2065,77 @@ def organic(bevel, strength, size):
 
 
 def flower_bush(P, M, x, y, z, r):
-    P.ico((x, y, z), r, M.hedge, scale=(1, 1, 0.75), sub=2, jitter=r * 0.08)
-    for i in range(int(40 * r * r)):
-        a = RNG.uniform(0, math.tau)
-        b = RNG.uniform(0.0, math.pi * 0.45)
-        p = Vector((x + math.cos(a) * math.sin(b + 0.5) * r, y + math.sin(a) * math.sin(b + 0.5) * r,
-                    z + math.cos(b + 0.5) * r * 0.75))
-        P.ico(p, RNG.uniform(0.07, 0.11), M.flower, scale=(1, 1, 0.5), sub=1)
+    """
+    黄花灌木（参考截图 26）：叶片贴图的圆顶 + 表面外翻的叶片 + 上半部缀满五瓣小黄花
+    """
+    rng = random.Random(int(abs(x * 31 + y * 17 + z)))
+    P.ico((x, y, z), r, M.hedge, scale=(1, 1, 0.78), sub=3, jitter=r * 0.035, smooth=True)
+    c = Vector((x, y, z))
+    area = 2.6 * math.pi * r * r
+    for _ in range(int(area * 70)):                     # 叶片
+        d = Vector((rng.gauss(0, 1), rng.gauss(0, 1), abs(rng.gauss(0, 1)) - 0.25)).normalized()
+        p = c + Vector((d.x * r, d.y * r, d.z * r * 0.78))
+        a = rng.uniform(0, math.tau)
+        t1, t2 = _frame(d)
+        leaf_card(P, p - d * 0.03, (d * 0.6 + t1 * math.cos(a) + t2 * math.sin(a)).normalized(),
+                  rng.uniform(0.09, 0.15), 0.45, rng.choice(M.leaves), rng)
+    for _ in range(int(area * 42)):                     # 小黄花
+        d = Vector((rng.gauss(0, 1), rng.gauss(0, 1), abs(rng.gauss(0, 1.2)) + 0.05)).normalized()
+        p = c + Vector((d.x * r * 1.02, d.y * r * 1.02, d.z * r * 0.8))
+        petal_flower(P, p, d, rng.uniform(0.06, 0.09), M.flower if rng.random() < 0.8 else M.flower_deep,
+                     M.flower_eye, rng)
 
 
 def cypress(P, M, x, y, z, h, r):
-    """柏树：暗色树芯 + 几百个向外、略向下的尖叶簇 → 羽毛状剪影"""
-    P.cyl((x, y, z + 0.8), 0.22, 1.6, M.bark, seg=8)
-    P.ico((x, y, z + h * 0.52), 1.0, M.cypress_dark, scale=(r * 0.8, r * 0.8, h * 0.46), sub=2)
-    n = int(h * 22)
-    for i in range(n):
-        t = RNG.uniform(0.08, 1.0)
-        zz = z + 0.9 + (h - 0.9) * t
-        prof = math.sin(math.pi * min(1.0, t * 1.05) ** 0.85) * (1.0 - 0.55 * t)
-        rr = r * max(0.12, prof)
-        a = RNG.uniform(0, math.tau)
-        base = Vector((x + math.cos(a) * rr * 0.55, y + math.sin(a) * rr * 0.55, zz))
-        d = Vector((math.cos(a), math.sin(a), RNG.uniform(0.2, 0.9) if t > 0.9 else RNG.uniform(-0.25, 0.35)))
-        P.cone_dir(base, d, RNG.uniform(0.28, 0.42) * (1.2 - t * 0.5), rr * 0.9 + 0.35,
-                   M.cypress if RNG.random() > 0.3 else M.cypress_dark)
+    """
+    柏树（参考截图 26）：树干 + 深色火焰形树芯 + 几百片锯齿边的羽状叶片，
+    向外、向上翘，越靠上越亮
+    """
+    rng = random.Random(int(abs(x * 7 + y * 11)))
+    P.cyl((x, y, z + 0.9), 0.24, 1.8, M.bark, seg=8, r2=0.18)
+    prof = lambda t: r * 0.95 * math.sin(math.pi * min(1.0, t * 1.08)) ** 0.75 * (1 - 0.45 * t)
+    P.lathe((x, y, z + 1.1), [(max(0.05, prof(t) * 0.7), (h - 1.1) * t) for t in (i / 12 for i in range(13))]
+            + [(0.0, h - 1.1)], M.cypress_dark, seg=10)
+    n = int(h * 48)
+    for _ in range(n):
+        t = rng.uniform(0.02, 1.0) ** 0.85
+        zz = z + 1.1 + (h - 1.1) * t
+        R = max(0.15, prof(t))
+        a = rng.uniform(0, math.tau)
+        out = Vector((math.cos(a), math.sin(a), 0))
+        base = Vector((x, y, zz)) + out * R * rng.uniform(0.35, 0.6)
+        up = rng.uniform(0.35, 1.0) + t * 0.6
+        d = (out + Vector((0, 0, up))).normalized()
+        L = R * rng.uniform(0.7, 1.0) + 0.35
+        if rng.random() < 0.15 + 0.5 * t:
+            mat = M.cypress_light
+        elif rng.random() < 0.3:
+            mat = M.cypress_dark
+        else:
+            mat = M.cypress
+        frond(P, base, d, L, L * rng.uniform(0.3, 0.42), mat, rng)
+
+
+def frond(P, base, d, L, W, mat, rng, seg=5):
+    """锯齿边羽状叶片：沿叶轴两侧各 seg 个尖齿，叶尖稍微上翘"""
+    d = Vector(d).normalized()
+    s1, _ = _frame(d)
+    roll = rng.uniform(-0.7, 0.7)
+    side = (s1 * math.cos(roll) + d.cross(s1) * math.sin(roll)).normalized()
+    up = Vector((0, 0, 1))
+    b = Vector(base)
+    axis = lambda t: b + d * (L * t) + up * (0.12 * L * t * t)
+    left, right = [], []
+    for i in range(seg):
+        t0 = (i + 0.2) / seg
+        t1 = (i + 0.85) / seg
+        w0 = W / 2 * math.sin(math.pi * t0) ** 0.7
+        w1 = W / 2 * math.sin(math.pi * min(t1, 0.98)) ** 0.7
+        left += [axis(t0) + side * w0 * 0.45, axis(t1) + side * w1]
+        right += [axis(t0) - side * w0 * 0.45, axis(t1) - side * w1]
+    bm = P.bm
+    pts = [b] + left + [axis(1.0)] + list(reversed(right))
+    P._tag_faces([bm.faces.new([bm.verts.new(v) for v in pts])], mat)
 
 
 # ===========================================================================
@@ -2031,8 +2296,8 @@ def build_tower_and_right_wall(M, C):
     P = Part("大墙花坛_树篱", C)
     h0, h1 = p0 + nO * 0.2 + dW * 0.2, p1 + nO * 0.2 - dW * 0.2
     xy_prism(P, [h0[:2], h1[:2], (h1 + nO * (depth - 0.4))[:2], (h0 + nO * (depth - 0.4))[:2]], 0.7, 1.45, M.hedge)
-    P.modifiers.append(organic(0.25, 0.1, 0.6))
-    P.finish()
+    P.modifiers.append(organic(0.25, 0.06, 0.6))
+    leaf_skin(P.finish(), C, M, seed=17)
     P = Part("大墙花坛_花", C)
     for t in (2.5, 11.0, 20.0):
         q = p0 + dW * t + nO * (depth * 0.55)
@@ -2192,6 +2457,10 @@ VIEWS = {
     "stairs_up": dict(loc=(-5.0, -2.2, 6.0), target=(-18.0, -9.0, 2.6), lens=22),
     # 参考图 24：高处俯看八角喷泉
     "fountain": dict(loc=(-5.8, -12.8, 13.0), target=(-7.3, -5.2, 0.0), lens=24),
+    # 参考图 25：门口花盆近景
+    "pot": dict(loc=(-1.3, -3.3, 1.8), target=(-2.45, -0.7, 0.75), lens=32),
+    # 参考图 26：花园里的树篱、黄花丛、柏树
+    "garden": dict(loc=(-15.5, -1.8, 3.6), target=(-10.0, 5.0, 2.8), lens=26),
     "facade_side": dict(loc=(5.6, -2.1, 2.6), target=(-4.0, 0.3, 5.3), lens=22),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
