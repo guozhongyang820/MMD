@@ -11,13 +11,15 @@
 | ![](preview_facade.png) | ![](preview_facade_side.png) |
 | **楼角与二层（参考图17）** | **圆塔与右侧大墙（参考图20）** |
 | ![](preview_corner.png) | ![](preview_tower.png) |
-| **圆塔底座（参考图19）** | |
-| ![](preview_tower_close.png) | |
+| **圆塔底座（参考图19）** | **仰看台阶与流水槽（参考图23）** |
+| ![](preview_tower_close.png) | ![](preview_stairs_up.png) |
+| **八角喷泉（参考图24）** | |
+| ![](preview_fountain.png) | |
 
 ## 文件
 - `fontaine_furina.py`：生成脚本（Blender 4.2+，在 5.0 上测试通过）
 - `fontaine_furina.blend`：生成好的场景，直接打开，小键盘 0 进相机，F12 渲染
-- `preview_*.png`：十一个机位的渲染
+- `preview_*.png`：各机位的渲染
 - `textures/`：程序生成的地砖贴图（颜色 + 高度），已打包进 .blend，这里是另存的 PNG
 
 ## 地砖（v2 新增）
@@ -39,6 +41,7 @@ blender -b -P fontaine_furina.py -- --view plaza  --render out.png --save scene.
 blender -b -P fontaine_furina.py -- --view ground --render out.png --export-textures textures
 # 地砖近景：--view doorstep / --view road
 # 只生成主楼（调细节更快）：--part building
+# 一次渲染多个机位（贴图只生成一次，也会缓存到 ~/.cache）：--view fountain,stairs_up --render "out_{view}.png"
 ```
 
 ## 场景结构（大纲视图 → 枫丹_芙宁娜家门口）
@@ -83,7 +86,16 @@ blender -b -P fontaine_furina.py -- --view ground --render out.png --export-text
 - **街道对面**：弧形抬高草坪（石边 + 人行道 + 路缘石）、路灯、长椅、花盆
 - 机位：`--view tower`、`--view tower_close`
 
+## 大台阶与喷泉（v8，参考截图 23、24）`build_stairs()`
+- 两段台阶夹着流水槽；每级踏面由错缝长石板拼成，鼻尖略挑出
+- 流水槽：两侧分段斜石沿，水面带浅色波光；在台阶底部平走一小段后接进喷泉
+- 八角喷泉：外圈低台座 + 石沿（朝台阶一边开口接水槽）+ 水池 + 中心喷头、水柱、水花和涟漪
+- 两侧挡土墙：拱纹浮雕墙面、白石壁柱、随台阶升高的斜压顶、底部方墩；花园一侧的土坡和树篱随台阶升高
+- 台阶另一侧花坛加高到 2 m（`SOUTH_BED_H`）；顶部平台两股小喷泉
+- 机位：`--view stairs_up`、`--view fountain`
+
 ## 已知的简化 / 下一步可以细化的地方
+- 台阶顶部平台之后游戏里还有第二段台阶，目前只做到平台
 - 主楼后面、塔后面的城墙目前只是带扶壁的大墙，游戏里的具体造型需要截图参考
 - 圆塔顶部、旗幡的真实形状和挂法
 - 台阶顶端平台连到哪里（参考图里看不到）

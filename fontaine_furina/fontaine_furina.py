@@ -341,8 +341,8 @@ class Mats:
     def __init__(self):
         # 主楼
         # 墙面石块贴图（程序生成）：砂岩大块 + 白石小块
-        sc_, sh_ = gen_ashlar(seed=1)
-        wc_, wh_ = gen_ashlar(n=1024, W=4.0, H=2.4, rows=(0.3, 0.42), widths=(0.4, 0.9), base="#EEE7DB",
+        sc_, sh_ = cached(gen_ashlar, seed=1)
+        wc_, wh_ = cached(gen_ashlar, n=1024, W=4.0, H=2.4, rows=(0.3, 0.42), widths=(0.4, 0.9), base="#EEE7DB",
                               lighter="#F2ECE3", darker="#E8E0D3", joint="#D3C9BB", bevel=0.025, seed=2)
         self.wall_tex = [make_image("砂岩墙_颜色", sc_), make_image("砂岩墙_高度", sh_, True),
                          make_image("白石墙_颜色", wc_), make_image("白石墙_高度", wh_, True)]
@@ -378,8 +378,8 @@ class Mats:
                        enumerate(("#B9C9A0", "#D8D2B4", "#9FBF9A", "#E3C9A2"))]
         # 地面
         # 地砖贴图（程序生成，见 gen_plaza_tiles / gen_hex_pavers）
-        pc, ph = gen_plaza_tiles()
-        hc, hh, hu, hv = gen_hex_pavers()
+        pc, ph = cached(gen_plaza_tiles)
+        hc, hh, hu, hv = cached(gen_hex_pavers)
         ca, sa = math.cos(math.radians(HEX_ROT)), math.sin(math.radians(HEX_ROT))
         hex_basis = tuple((ca * x - sa * y, sa * x + ca * y) for x, y in (hu, hv))
         self.tex = [make_image("广场地砖_颜色", pc), make_image("广场地砖_高度", ph, True),
@@ -395,7 +395,7 @@ class Mats:
         self.step = toon("台阶", "#DEDAD4")
         self.step_riser = toon("台阶踢面", "#B8B4B0")
         self.wall_relief = toon("拱纹挡土墙", "#E3DDD4", "scallop", 0.9, "W", 0.9)
-        self.water = toon("水", "#8FE0EC", emit=0.15, sheen=("#E6FFFF", 0.6))
+        self.water = toon("水", "#4FB0D0", emit=0.1, sheen=("#BFF3FF", 0.5))
         self.water_jet = toon("喷泉水柱", "#E8FBFF", emit=0.4, alpha=0.8)
         # 远景建筑
         big = lambda pl, r=1.0, tint=None: dict(color=self.wall_tex[2], height=self.wall_tex[3], size=(12.0, 7.2),
@@ -635,6 +635,31 @@ def gen_ashlar(n=2048, W=8.0, H=4.0, rows=(0.42, 0.6), widths=(0.55, 1.35), base
     col = col * (1 - jn[..., None]) + _hex2rgb(joint) * jn[..., None]
     height = (0.2 + 0.8 * b ** 0.5) * (1 - jn)
     return np.clip(col, 0, 1), np.clip(height, 0, 1)
+
+
+TEX_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "fontaine_furina_tex")
+
+
+def cached(fn, *args, **kw):
+    """贴图生成比较慢：按函数名 + 参数 + 生成代码缓存到磁盘，改了参数或代码会自动重新生成"""
+    import hashlib
+    import inspect
+    import pickle
+    key = hashlib.md5(repr((fn.__name__, args, sorted(kw.items()), inspect.getsource(fn))).encode()).hexdigest()
+    path = os.path.join(TEX_CACHE, fn.__name__ + "_" + key + ".pkl")
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        pass
+    res = fn(*args, **kw)
+    try:
+        os.makedirs(TEX_CACHE, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(res, f, protocol=4)
+    except Exception:
+        pass
+    return res
 
 
 def make_image(name, arr, non_color=False):
@@ -1531,6 +1556,7 @@ STAIR_H = 5.0
 CHANNEL_Y = (STAIR_Y0 + STAIR_Y1) / 2
 GARDEN = (-22.0, -8.0, -3.0, 10.0)   # x0, x1, y0, y1
 GARDEN_Z = 2.0
+SOUTH_BED_H = 2.0                    # 台阶另一侧花坛的高度
 
 
 def stair_z(x):
@@ -1584,55 +1610,162 @@ def manhole(P, M, x, y, z, r=0.55):
     P.beam((x - r * 0.3, y, z + 0.04), (x + r * 0.3, y, z + 0.04), 0.05, 0.014, M.gold_dark)
 
 
+CH_W, CURB_W = 0.56, 0.32            # 流水槽水面宽 / 两侧石沿宽
+CURB_TOP, WATER_TOP = 0.45, 0.3      # 石沿顶、水面 相对台阶斜线的高度
+FOUNT_R = 1.65                       # 八角喷泉外接圆半径
+FOUNT_X = STAIR_X0 + 1.0 + (FOUNT_R + 0.15) * math.cos(math.pi / 8)
+N_STEPS = 26
+
+
+def stair_line(x):
+    """台阶鼻尖连线的高度（流水槽、石沿、侧墙都顺着它走）"""
+    return max(0.0, min(STAIR_H, (STAIR_X0 - x) / (STAIR_X0 - STAIR_X1) * STAIR_H))
+
+
+def slope_prism(P, x0, x1, y0, y1, zb0, zt0, zb1, zt1, mat):
+    """x0→x1 之间、底 / 顶高度线性变化的斜块（x0 处 zb0/zt0，x1 处 zb1/zt1）"""
+    P.prism([(x0, zb0), (x1, zb1), (x1, zt1), (x0, zt0)], mat, lambda x, z, t: (x, y0 + (y1 - y0) * t, z))
+
+
+def stair_side_wall(P, M, y0, y1, face_y, top_min, x_end):
+    """
+    台阶一侧的挡土墙（参考截图 23）：墙顶 = max(top_min, 台阶线 + 1.1)，
+    拱纹浮雕墙面、白石壁柱分段、斜压顶，底部在广场上以方墩收头
+    """
+    xs = [STAIR_X0 + 0.9] + [STAIR_X0 - k * 0.5 for k in range(0, 60) if STAIR_X0 - k * 0.5 > x_end] + [x_end]
+    xs = sorted(set(xs), reverse=True)
+    top = lambda x: max(top_min, stair_line(x) + 1.1)
+    for a, b in zip(xs, xs[1:]):
+        slope_prism(P, a, b, y0, y1, 0.0, top(a), 0.0, top(b), M.wall_relief)
+        slope_prism(P, a, b, y0 - 0.06, y1 + 0.06, top(a), top(a) + 0.16, top(b), top(b) + 0.16, M.stone)
+    sgn = 1 if face_y > (y0 + y1) / 2 else -1
+    fy0, fy1 = (y1, y1 + 0.1) if sgn > 0 else (y0 - 0.1, y0)
+    for k in range(6):                                  # 壁柱
+        x = STAIR_X0 - 0.6 - k * 3.2
+        if x < x_end + 0.3:
+            break
+        P.box_mm(x - 0.25, x + 0.25, fy0, fy1, 0.0, top(x) - 0.05, M.stone)
+    P.box_mm(x_end, STAIR_X0 + 0.9, fy0, fy1, 0.0, 0.25, M.stone)       # 勒脚
+    # 底部方墩
+    P.box_mm(STAIR_X0 + 0.6, STAIR_X0 + 1.4, y0 - 0.12, y1 + 0.12, 0.0, top_min + 0.35, M.stone)
+    P.box_mm(STAIR_X0 + 0.5, STAIR_X0 + 1.5, y0 - 0.2, y1 + 0.2, top_min + 0.35, top_min + 0.5, M.stone)
+
+
 def build_stairs(M, root):
+    """
+    大台阶 + 流水槽 + 八角喷泉（参考截图 23、24）：
+      两段台阶夹着中间的流水槽；每级踏面由错缝长石板拼成，鼻尖略挑出
+      流水槽两侧是分段的斜石沿，水面有浅色波光；槽在台阶底部平走一小段后接进八角喷泉
+      八角喷泉：外圈低台座 + 石沿（面向台阶的一边开口接水槽）+ 水池 + 中心喷头与水花
+      两侧挡土墙带拱纹浮雕，花园一侧的土坡随台阶升高；顶部平台两股小喷泉
+    """
     C = collection("大台阶与喷泉", root)
-    P = Part("大台阶", C, bevel=0.03)
-    n = 26
-    run = (STAIR_X0 - STAIR_X1) / n
-    rise = STAIR_H / n
-    for i in range(n):
+    rng = random.Random(5)
+    run = (STAIR_X0 - STAIR_X1) / N_STEPS
+    rise = STAIR_H / N_STEPS
+    ch0, ch1 = CHANNEL_Y - CH_W / 2 - CURB_W, CHANNEL_Y + CH_W / 2 + CURB_W
+    flights = ((STAIR_Y0, ch0), (ch1, STAIR_Y1))
+
+    P = Part("大台阶", C, bevel=0.025)
+    for i in range(N_STEPS):
         x = STAIR_X0 - i * run
         z = (i + 1) * rise
-        P.box_mm(STAIR_X1, x, STAIR_Y0, STAIR_Y1, z - rise - 0.05, z - 0.05, M.step_riser)
-        P.box_mm(x - run, x + 0.04, STAIR_Y0, STAIR_Y1, z - 0.06, z, M.step)
+        P.box_mm(x - run, x - 0.02, STAIR_Y0, STAIR_Y1, 0.0, z - 0.07, M.step_riser)
+        for fy0, fy1 in flights:                        # 踏面：错缝长石板
+            y = fy0
+            first = True
+            while y < fy1 - 0.05:
+                L = rng.uniform(0.9, 1.6) if not first else rng.uniform(0.4, 1.4)
+                first = False
+                y1 = min(fy1, y + L)
+                if fy1 - y1 < 0.35:
+                    y1 = fy1
+                P.box_mm(x - run - 0.01, x + 0.05, y + 0.008, y1 - 0.008, z - 0.07, z, M.step)
+                y = y1
     P.box_mm(STAIR_X1 - 14, STAIR_X1, STAIR_Y0 - 12, STAIR_Y1 + 3, 0.0, STAIR_H, M.step)       # 顶部平台
-    # 台阶实心底座
-    P.prism([(STAIR_X0, 0), (STAIR_X1, STAIR_H - 0.3), (STAIR_X1, 0)], M.step_riser,
-            lambda x, z, t: (x, STAIR_Y0 + (STAIR_Y1 - STAIR_Y0) * t, z))
-    # 两侧矮墙（顺着台阶斜上）
-    for y0, y1 in ((STAIR_Y0 - 0.6, STAIR_Y0), (STAIR_Y1, STAIR_Y1 + 0.35)):
-        P.prism([(STAIR_X0 + 0.6, 0), (STAIR_X0 + 0.6, 0.8), (STAIR_X1, STAIR_H + 0.8), (STAIR_X1, 0)], M.curb,
-                lambda x, z, t: (x, y0 + (y1 - y0) * t, z))
-        P.prism([(STAIR_X0 + 0.6, 0.8), (STAIR_X1, STAIR_H + 0.8), (STAIR_X1, STAIR_H + 0.95),
-                 (STAIR_X0 + 0.6, 0.95)], M.stone,
-                lambda x, z, t: (x, y0 - 0.05 + (y1 - y0 + 0.1) * t, z))
-    # 中间流水槽
-    cw = 0.6
-    for s in (-1, 1):
-        y = CHANNEL_Y + s * (cw / 2 + 0.1)
-        P.prism([(STAIR_X0 + 0.2, 0), (STAIR_X0 + 0.2, 0.3), (STAIR_X1, STAIR_H + 0.3), (STAIR_X1, STAIR_H)],
-                M.curb, lambda x, z, t, y=y: (x, y - 0.1 + 0.2 * t, z))
+    P.finish()
+
+    # ---- 两侧挡土墙
+    P = Part("台阶挡土墙", C, bevel=0.03)
+    stair_side_wall(P, M, STAIR_Y1, STAIR_Y1 + 0.4, STAIR_Y1, GARDEN_Z + 0.55, STAIR_X1)        # 花园一侧
+    stair_side_wall(P, M, STAIR_Y0 - 0.5, STAIR_Y0, STAIR_Y0, SOUTH_BED_H + 0.5, STAIR_X1)      # 另一侧
+    P.finish()
+
+    # ---- 流水槽石沿（分段）+ 平走段
+    P = Part("流水槽石沿", C, bevel=0.03)
+    x_oct = FOUNT_X - FOUNT_R * math.cos(math.pi / 8)
+    seg = [x_oct] + [STAIR_X0 - k * 1.9 for k in range(0, 9) if STAIR_X0 - k * 1.9 > STAIR_X1] + [STAIR_X1 - 1.5]
+    for a, b in zip(seg, seg[1:]):
+        for y0, y1 in ((ch0, ch0 + CURB_W), (ch1 - CURB_W, ch1)):
+            slope_prism(P, a - 0.012, b + 0.012, y0, y1, 0.0, stair_line(a) + CURB_TOP,
+                        0.0, stair_line(b) + CURB_TOP, M.curb)
     P.finish()
 
     P = Part("流水", C)
-    P.prism([(STAIR_X0 + 0.2, 0.05), (STAIR_X0 + 0.2, 0.22), (STAIR_X1, STAIR_H + 0.22), (STAIR_X1, STAIR_H + 0.05)],
-            M.water, lambda x, z, t: (x, CHANNEL_Y - cw / 2 + cw * t, z))
+    w0, w1 = CHANNEL_Y - CH_W / 2, CHANNEL_Y + CH_W / 2
+    slope_prism(P, x_oct + 0.3, STAIR_X0, w0, w1, 0.0, WATER_TOP, 0.0, WATER_TOP, M.water)
+    slope_prism(P, STAIR_X0, STAIR_X1 - 1.5, w0, w1, 0.0, WATER_TOP, 0.0, STAIR_H + WATER_TOP, M.water)
+    for k in range(22):                                 # 波光
+        x = rng.uniform(STAIR_X1 + 0.5, x_oct)
+        y = rng.uniform(w0 + 0.08, w1 - 0.08)
+        L = rng.uniform(0.25, 0.7)
+        z0, z1 = stair_line(x) + WATER_TOP + 0.005, stair_line(x - L) + WATER_TOP + 0.005
+        P.beam((x, y, z0), (x - L, y + rng.uniform(-0.05, 0.05), z1), 0.025, 0.004, M.water_jet)
     P.finish()
 
-    # 八角喷泉
-    P = Part("八角喷泉", C, bevel=0.03)
-    fx, fy = STAIR_X0 + 1.3, CHANNEL_Y
-    R0, R1 = 1.5, 1.15
-    oct_out = [(fx + R0 * math.cos(a), fy + R0 * math.sin(a)) for a in (math.pi / 8 + k * math.pi / 4 for k in range(8))]
-    oct_in = [(fx + R1 * math.cos(a), fy + R1 * math.sin(a)) for a in (math.pi / 8 + k * math.pi / 4 for k in range(8))]
-    P.sweep(oct_out, [(0.0, 0.0), (0.12, 0.0), (0.12, 0.12), (0.0, 0.2), (0.0, 0.42), (0.08, 0.5),
-                      (-(R0 - R1) * 1.08, 0.5), (-(R0 - R1) * 1.08, 0.0)], M.curb)
-    bm = P.bm
-    fs = bm.faces.new([bm.verts.new((x, y, 0.36)) for x, y in oct_in])
-    P._tag_faces([fs], M.water)
+    # ---- 八角喷泉
+    P = Part("八角喷泉", C, bevel=0.035)
+    fx, fy = FOUNT_X, CHANNEL_Y
+    oct_ = lambda R: [(fx + R * math.cos(a), fy + R * math.sin(a)) for a in (math.pi / 8 + k * math.pi / 4
+                                                                            for k in range(8))]
+    O, I, B = oct_(FOUNT_R), oct_(FOUNT_R - 0.32), oct_(FOUNT_R + 0.15)
+    for k in range(8):                                  # 外圈低台座
+        j = (k + 1) % 8
+        xy_prism(P, [B[k], B[j], O[j], O[k]], 0.0, 0.1, M.curb)
+    for k in range(8):                                  # 石沿（朝台阶的那一边开口）
+        j = (k + 1) % 8
+        if k == 3:                                      # 这一边朝台阶：中间留出水槽宽度的开口
+            xo, xi = O[k][0], I[k][0]
+            for ya, yb in ((O[j][1], w0), (w1, O[k][1])):
+                xy_prism(P, [(xo, ya), (xo, yb), (xi, yb), (xi, ya)], 0.0, CURB_TOP, M.curb)
+            continue
+        xy_prism(P, [O[k], O[j], I[j], I[k]], 0.0, CURB_TOP, M.curb)
+    xy_prism(P, I, 0.0, 0.05, M.stone_relief)           # 池底
+    P.finish()
+    P = Part("喷泉水面", C)
+    xy_prism(P, I, 0.05, WATER_TOP - 0.02, M.water)
+    for rr in (0.35, 0.6, 0.85):                       # 水面涟漪
+        a0 = rng.uniform(0, math.tau)
+        ring_arc(P, fx, fy, rr, rr + 0.03, a0, a0 + rng.uniform(2.0, 4.0), WATER_TOP - 0.02, WATER_TOP - 0.015,
+                 M.water_jet, 16)
     P.finish()
     P = Part("喷泉水柱", C)
-    P.lathe((fx, fy, 0.35), [(0.18, 0.0), (0.06, 0.3), (0.03, 1.1), (0.08, 1.3), (0.0, 1.35)], M.water_jet, seg=12)
+    P.lathe((fx, fy, 0.0), [(0.22, 0.0), (0.22, WATER_TOP + 0.05), (0.15, WATER_TOP + 0.12), (0.0, WATER_TOP + 0.12)],
+            M.curb, seg=12)
+    P.lathe((fx, fy, WATER_TOP + 0.1), [(0.12, 0.0), (0.07, 0.3), (0.05, 0.9), (0.1, 1.1), (0.14, 1.15),
+                                        (0.0, 1.2)], M.water_jet, seg=12)
+    for k in range(14):                                 # 落下的水花
+        a = k / 14 * math.tau + rng.uniform(-0.1, 0.1)
+        rr = rng.uniform(0.25, 0.5)
+        P.ico((fx + math.cos(a) * rr, fy + math.sin(a) * rr, WATER_TOP + rng.uniform(0.02, 0.12)),
+              rng.uniform(0.06, 0.11), M.water_jet, scale=(1, 1, 0.6), sub=1)
+    # 顶部平台两股小喷泉
+    for s_ in (-1, 1):
+        x, y = STAIR_X1 - 0.8, CHANNEL_Y + s_ * 1.3
+        P.lathe((x, y, STAIR_H), [(0.3, 0.0), (0.3, 0.15), (0.2, 0.2), (0.0, 0.2)], M.curb, seg=12)
+        P.lathe((x, y, STAIR_H + 0.18), [(0.08, 0.0), (0.05, 0.3), (0.1, 0.7), (0.0, 0.75)], M.water_jet, seg=10)
+    P.finish()
+
+    # ---- 花园一侧随台阶升高的土坡（树篱顺着坡走）
+    P = Part("台阶旁土坡", C)
+    xg = GARDEN[0]
+    slope_prism(P, STAIR_X0 - 4.0, xg, STAIR_Y1 + 0.4, STAIR_Y1 + 3.5, 0.0, GARDEN_Z + 0.25, 0.0,
+                max(GARDEN_Z, stair_line(xg) + 0.85), M.grass)
+    P.finish()
+    P = Part("台阶旁树篱", C)
+    slope_prism(P, STAIR_X0 - 4.5, xg, STAIR_Y1 + 0.5, STAIR_Y1 + 1.3, GARDEN_Z + 0.2, GARDEN_Z + 0.95,
+                stair_line(xg) + 0.8, stair_line(xg) + 1.6, M.hedge)
+    P.modifiers.append(organic(0.25, 0.1, 0.6))
     P.finish()
 
 
@@ -1677,19 +1810,21 @@ def build_garden(M, root):
     P.finish()
 
     # 台阶另一侧的低花坛
+    H = SOUTH_BED_H
     P = Part("右侧花坛", C, bevel=0.03)
-    P.box_mm(STAIR_X1, STAIR_X0 - 0.5, STAIR_Y0 - 9.0, STAIR_Y0 - 0.6, 0.0, 1.0, M.wall_relief)
-    P.sweep([(STAIR_X1, STAIR_Y0 - 9.0), (STAIR_X0 - 0.5, STAIR_Y0 - 9.0), (STAIR_X0 - 0.5, STAIR_Y0 - 0.6),
-             (STAIR_X1, STAIR_Y0 - 0.6)], [(0.0, 0.9), (0.12, 0.9), (0.12, 1.25), (-0.3, 1.25), (-0.3, 1.0)], M.stone)
+    P.box_mm(STAIR_X1, STAIR_X0 + 0.9, STAIR_Y0 - 9.0, STAIR_Y0 - 0.5, 0.0, H, M.wall_relief)
+    P.sweep([(STAIR_X1, STAIR_Y0 - 9.0), (STAIR_X0 + 0.9, STAIR_Y0 - 9.0), (STAIR_X0 + 0.9, STAIR_Y0 - 0.5),
+             (STAIR_X1, STAIR_Y0 - 0.5)], [(0.0, H - 0.1), (0.12, H - 0.1), (0.12, H + 0.25), (-0.3, H + 0.25),
+                                           (-0.3, H)], M.stone)
     P.finish()
     P = Part("右侧花坛_植物", C)
-    P.box_mm(STAIR_X1 + 0.3, STAIR_X0 - 0.8, STAIR_Y0 - 8.7, STAIR_Y0 - 0.9, 1.0, 1.2, M.grass)
-    P.box_mm(STAIR_X1 + 0.5, STAIR_X0 - 1.0, STAIR_Y0 - 1.9, STAIR_Y0 - 1.0, 1.2, 1.9, M.hedge)
+    P.box_mm(STAIR_X1 + 0.3, STAIR_X0 + 0.6, STAIR_Y0 - 8.7, STAIR_Y0 - 0.8, H, H + 0.2, M.grass)
+    P.box_mm(STAIR_X1 + 0.5, STAIR_X0 + 0.4, STAIR_Y0 - 2.2, STAIR_Y0 - 0.9, H + 0.2, H + 1.0, M.hedge)
     P.modifiers.append(organic(0.2, 0.1, 0.6))
     P.finish()
     P = Part("右侧花坛_花", C)
-    for x in (STAIR_X0 - 2.5, STAIR_X0 - 7.0, STAIR_X0 - 12.0):
-        flower_bush(P, M, x, STAIR_Y0 - 1.5, 1.8, 0.8)
+    for x in (STAIR_X0 - 1.5, STAIR_X0 - 7.0, STAIR_X0 - 12.0):
+        flower_bush(P, M, x, STAIR_Y0 - 1.6, H + 0.9, 0.8)
     P.finish()
 
 
@@ -1764,7 +1899,7 @@ def build_props(M, root):
     C = collection("路灯", root)
     P = Part("路灯", C, bevel=0.01)
     street_lamp(P, M, GARDEN[1] - 0.2, GARDEN[2] + 0.4, 0.0)       # 花园转角
-    street_lamp(P, M, STAIR_X0 + 3.0, STAIR_Y0 - 2.0, 0.0)          # 喷泉旁
+    street_lamp(P, M, STAIR_X0 + 3.4, STAIR_Y0 - 1.6, 0.0)          # 喷泉旁
     street_lamp(P, M, -4.0, -12.6, 0.0)
     P.finish()
 
@@ -2053,6 +2188,10 @@ VIEWS = {
     "tower": dict(loc=(22.0, -13.0, 16.0), target=(11.0, 5.0, 0.0), lens=24),
     # 参考图 19：书报摊旁看圆塔底座
     "tower_close": dict(loc=(6.2, -4.8, 6.4), target=(10.2, 1.5, 0.6), lens=24),
+    # 参考图 23：广场上仰看台阶和流水槽
+    "stairs_up": dict(loc=(-5.0, -2.2, 6.0), target=(-18.0, -9.0, 2.6), lens=22),
+    # 参考图 24：高处俯看八角喷泉
+    "fountain": dict(loc=(-5.8, -12.8, 13.0), target=(-7.3, -5.2, 0.0), lens=24),
     "facade_side": dict(loc=(5.6, -2.1, 2.6), target=(-4.0, 0.3, 5.3), lens=22),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
@@ -2069,15 +2208,21 @@ def setup_lights_camera(root, view):
     ob.rotation_euler = Vector((0.55, 0.45, -0.7)).normalized().to_track_quat("-Z", "Y").to_euler()
     ob.location = (-20, -30, 40)
 
-    v = VIEWS[view]
     cam = bpy.data.cameras.new("相机")
-    cam.lens = v["lens"]
     cam.clip_end = 1000
     co = bpy.data.objects.new("相机", cam)
     C.objects.link(co)
+    bpy.context.scene.camera = co
+    set_view(view)
+
+
+def set_view(view):
+    """把相机移到某个预设机位"""
+    v = VIEWS[view]
+    co = bpy.context.scene.camera
+    co.data.lens = v["lens"]
     co.location = v["loc"]
     co.rotation_euler = (Vector(v["target"]) - Vector(v["loc"])).to_track_quat("-Z", "Y").to_euler()
-    bpy.context.scene.camera = co
 
 
 def setup_render(engine, res, samples, outline):
@@ -2143,7 +2288,8 @@ def parse_args():
     p.add_argument("--res", default="1600x1000")
     p.add_argument("--samples", type=int, default=32)
     p.add_argument("--outline", action="store_true")
-    p.add_argument("--view", choices=tuple(VIEWS), default="front")
+    p.add_argument("--view", default="front",
+                   help="机位，可以用逗号连写多个一次渲染完：" + ",".join(VIEWS))
     p.add_argument("--part", choices=("all", "building"), default="all")
     p.add_argument("--export-textures", help="把生成的地砖贴图另存为 PNG 到这个文件夹")
     args, _ = p.parse_known_args(argv)
@@ -2152,7 +2298,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    build(args.view, args.part)
+    views = [v.strip() for v in args.view.split(",") if v.strip()]
+    for v in views:
+        if v not in VIEWS:
+            raise SystemExit("未知机位 %s，可选：%s" % (v, ", ".join(VIEWS)))
+    build(views[0], args.part)
     w, h = (int(v) for v in args.res.lower().split("x"))
     setup_render(args.engine, (w, h), args.samples, args.outline)
     if args.export_textures:
@@ -2161,8 +2311,15 @@ def main():
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
     if args.render:
-        bpy.context.scene.render.filepath = os.path.abspath(args.render)
-        bpy.ops.render.render(write_still=True)
+        # 多个机位时，输出路径里的 {view} 会替换成机位名（没有 {view} 就自动加在文件名后面）
+        for v in views:
+            set_view(v)
+            out = args.render
+            if len(views) > 1 and "{view}" not in out:
+                root_, ext = os.path.splitext(out)
+                out = root_ + "_{view}" + ext
+            bpy.context.scene.render.filepath = os.path.abspath(out.replace("{view}", v))
+            bpy.ops.render.render(write_still=True)
 
 
 if __name__ == "__main__":
