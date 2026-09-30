@@ -34,6 +34,7 @@ import os
 import random
 import sys
 
+import numpy as np
 import bpy  # 必须先导入 bpy（作为 Python 模块使用时 bmesh 依赖它）
 import bmesh
 from mathutils import Euler, Matrix, Vector
@@ -165,13 +166,15 @@ def _pattern(nt, kind, scale, plane, radius=1.0):
 
 
 def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHADOW,
-         emit=0.0, sheen=None, radius=1.0, alpha=1.0):
+         emit=0.0, sheen=None, radius=1.0, alpha=1.0, image=None):
     """
     卡通材质（EEVEE）：Diffuse → Shader to RGB → 柔和两段色阶 → 乘底色 → Emission
     Cycles 下自动退化为 Principled BSDF。
       pattern/scale/plane/dark  程序纹理（石块、瓦片、地砖……）
       sheen=(hex, amount)       视角掠射时的亮边，用于金饰、玻璃
       emit                      自发光（灯、水）
+      image=dict(color=, height=, size=(宽米, 高米), rot=度, bump=强度)
+                                平铺贴图（地砖）：按世界尺寸平铺，高度图做凹凸
     """
     m = bpy.data.materials.new(name)
     try:
@@ -185,6 +188,29 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
     rgb = N("ShaderNodeRGB")
     rgb.outputs[0].default_value = srgb(color)
     base = rgb.outputs[0]
+    normal = None
+
+    if image:
+        tc = N("ShaderNodeTexCoord")
+        mp = N("ShaderNodeMapping")
+        sx, sy = image["size"]
+        mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1)
+        mp.inputs["Rotation"].default_value = (0, 0, math.radians(image.get("rot", 0)))
+        L(tc.outputs["Object"], mp.inputs["Vector"])
+        it = N("ShaderNodeTexImage")
+        it.image = image["color"]
+        it.interpolation = "Cubic"
+        L(mp.outputs[0], it.inputs["Vector"])
+        base = it.outputs["Color"]
+        if image.get("height"):
+            ht = N("ShaderNodeTexImage")
+            ht.image = image["height"]
+            L(mp.outputs[0], ht.inputs["Vector"])
+            bp = N("ShaderNodeBump")
+            bp.inputs["Strength"].default_value = image.get("bump", 0.6)
+            bp.inputs["Distance"].default_value = 0.01
+            L(ht.outputs["Color"], bp.inputs["Height"])
+            normal = bp.outputs["Normal"]
 
     if pattern:
         f = _pattern(nt, pattern, scale, plane, radius)
@@ -213,6 +239,8 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
     else:
         diff = N("ShaderNodeBsdfDiffuse")
         diff.inputs["Color"].default_value = (1, 1, 1, 1)
+        if normal:
+            L(normal, diff.inputs["Normal"])
         s2r = N("ShaderNodeShaderToRGB")
         L(diff.outputs[0], s2r.inputs[0])
         ramp = N("ShaderNodeValToRGB")
@@ -252,6 +280,8 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
     L(base, pb.inputs["Base Color"])
     pb.inputs["Roughness"].default_value = 0.75
     pb.inputs["Alpha"].default_value = alpha
+    if normal:
+        L(normal, pb.inputs["Normal"])
     if emit > 0:
         L(base, pb.inputs["Emission Color"])
         pb.inputs["Emission Strength"].default_value = 1.0 + emit
@@ -283,9 +313,17 @@ class Mats:
         self.books = [toon("书_%d" % i, c) for i, c in
                       enumerate(("#E8D7B0", "#9BC4A6", "#D98C6A", "#6E9BB8", "#F0E6CC"))]
         # 地面
-        self.plaza = toon("广场地砖", "#E7CDBF", "tiles", 1.6, "XY", 1.12)
-        self.sidewalk = toon("玫瑰色人行道", "#DDA394", "bricks", 1.8, "XY", 0.9)
+        # 地砖贴图（程序生成，见 gen_plaza_tiles / gen_hex_pavers）
+        pc, ph = gen_plaza_tiles()
+        hc, hh, hw_m, hh_m = gen_hex_pavers()
+        self.tex = [make_image("广场地砖_颜色", pc), make_image("广场地砖_高度", ph, True),
+                    make_image("六边形砖_颜色", hc), make_image("六边形砖_高度", hh, True)]
+        self.plaza = toon("广场地砖", "#E7CDBF", image=dict(
+            color=self.tex[0], height=self.tex[1], size=(2 * PLAZA_TILE, 2 * PLAZA_TILE), rot=45, bump=0.5))
+        self.sidewalk = toon("六边形人行道", "#C9938A", image=dict(
+            color=self.tex[2], height=self.tex[3], size=(hw_m, hh_m), rot=0, bump=0.6))
         self.curb = toon("路缘石", "#E4D6CC")
+        self.road_curb = toon("灰色路缘石", "#B8B6B6")
         self.step = toon("台阶", "#DEDAD4")
         self.step_riser = toon("台阶踢面", "#B8B4B0")
         self.wall_relief = toon("拱纹挡土墙", "#E3DDD4", "scallop", 0.9, "W", 0.9)
@@ -308,6 +346,194 @@ class Mats:
         self.bark = toon("树干", "#8A5A3A")
         self.pot = toon("花盆", "#E5DDD0")
         self.lamp_glass = toon("灯罩", "#EAF6F0", emit=0.3)
+
+
+# ===========================================================================
+# 地砖贴图：用 numpy 逐像素画出可无缝平铺的图案（颜色图 + 高度图）
+# ===========================================================================
+
+
+PLAZA_TILE = 1.7            # 广场大方砖边长（米），贴图里放 2×2 块
+PLAZA_PX = 2048
+HEX_REPEAT = 4              # 贴图里横竖各放几个周期（周期越多，色差越不重复）
+HEX_PX = 2048
+
+
+def _hex2rgb(h):
+    h = h.lstrip("#")
+    return np.array([int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)])
+
+
+def _hash(*xs):
+    """整数 → 0..1 的伪随机数（每块砖一个固定色差）"""
+    s = np.zeros_like(np.asarray(xs[0], dtype=np.float64))
+    for k, x in enumerate(xs):
+        s = s + np.asarray(x, dtype=np.float64) * (12.9898 + 41.23 * k)
+    return np.modf(np.abs(np.sin(s) * 43758.5453))[0]
+
+
+def _cover(d, w, px):
+    """到线中心的距离 d → 线宽 w 的覆盖率（抗锯齿 1 像素）"""
+    return np.clip(0.5 - (d - w / 2) / px, 0.0, 1.0)
+
+
+def _lowfreq_noise(x, y, seed):
+    """几层正弦叠加的低频斑驳（石材的不均匀感），周期与贴图对齐保证无缝"""
+    rng = np.random.RandomState(seed)
+    n = np.zeros_like(x)
+    for f in (1, 2, 3, 5, 8):
+        for _ in range(2):
+            ax, ay = rng.randint(-f, f + 1, size=2)
+            ph = rng.uniform(0, 2 * np.pi)
+            n += np.sin(2 * np.pi * (ax * x + ay * y) + ph) / f
+    return n / 4.0
+
+
+def gen_plaza_tiles(n=PLAZA_PX):
+    """
+    广场“画框”砖（参考截图 6）：
+      大方砖（贴图里轴对齐，材质里再转 45°）
+        ├ 中心小方块
+        ├ 两圈砖条，沿对角线斜接（形成从中心放射的 X 线）
+        └ 每圈按错缝切成小砖
+      白色细缝，大砖之间是深一点的粉褐色缝
+    返回 (rgb[H,W,3], height[H,W])，覆盖 2×2 块大砖
+    """
+    t = (np.arange(n) + 0.5) / n                       # 0..1
+    X, Y = np.meshgrid(t, t)                           # Y 向上（第 0 行 = 贴图底部）
+    gx, gy = X * 2, Y * 2
+    ix, iy = np.floor(gx), np.floor(gy)
+    u, v = (gx - ix) * 2 - 1, (gy - iy) * 2 - 1        # 每块砖内 -1..1
+    px = 4.0 / n                                       # 一个像素在 u 单位里的大小
+    au, av = np.abs(u), np.abs(v)
+    r = np.maximum(au, av)
+
+    R0, R1 = 0.30, 0.64                                # 中心块 / 内圈 / 外圈 分界
+    ring = np.where(r < R0, 0, np.where(r < R1, 1, 2))
+    horiz = au >= av
+    side = np.where(horiz, np.where(u > 0, 0, 1), np.where(v > 0, 2, 3))
+    along = np.where(horiz, v, u)                      # 沿砖条方向的坐标
+
+    # 错缝：两圈砖条长度、起点不同
+    # 内圈：接缝在 ±0.22（中间一块长砖 + 两端梯形砖）；外圈：接缝在 0、±0.5（与内圈错开）
+    L = np.where(ring == 1, 0.44, 0.50)
+    off = np.where(ring == 1, 0.22, 0.0)
+    q = (along + off) / L
+    brick = np.floor(q)
+    d_joint = np.abs(q - np.round(q)) * L
+
+    d_miter = np.abs(au - av) / np.sqrt(2)
+    d_ring = np.minimum(np.abs(r - R0), np.abs(r - R1))
+    inf = np.full_like(r, 9.0)
+    d_joint = np.where(ring > 0, d_joint, inf)
+    d_miter = np.where(r > R0 - 0.005, d_miter, inf)
+    d_white = np.minimum(np.minimum(d_ring, d_miter), d_joint)
+    d_white = np.where(r < 1 - 0.02, d_white, inf)
+
+    white = _cover(d_white, 0.014, px)
+    border = _cover(1 - r, 0.03, px)                   # 大砖之间的缝（离边 0 处）
+    bevel = np.clip((1 - r) / 0.05, 0, 1)              # 大砖边缘的小倒角
+
+    # 每小块颜色差异
+    pid = np.where(ring == 0, 0, ring * 100 + side * 20 + brick + 50)
+    h = _hash(ix * 7 + iy * 13, pid)
+    base = _hex2rgb("#E8CFC0")
+    warm = _hex2rgb("#F1D2BA")
+    col = base[None, None, :] * (0.965 + 0.07 * h[..., None])
+    col = col * (1 - 0.35 * h[..., None] * (h[..., None] > 0.8)) + warm * 0.35 * h[..., None] * (h[..., None] > 0.8)
+    col *= (1 + 0.025 * _lowfreq_noise(X, Y, 3))[..., None]
+    col *= (0.93 + 0.07 * bevel)[..., None]
+    col = col * (1 - white[..., None]) + _hex2rgb("#F7EEE6") * white[..., None]
+    col = col * (1 - border[..., None]) + _hex2rgb("#B58A80") * border[..., None]
+
+    height = 0.35 + 0.65 * bevel ** 0.5
+    height = height - 0.25 * white
+    height = height * (1 - border)
+    return np.clip(col, 0, 1), np.clip(height, 0, 1)
+
+
+def gen_hex_pavers(n=HEX_PX, rep=HEX_REPEAT, s=0.15, A=0.63, h=0.36):
+    """
+    玫瑰色六边形砖（参考截图 7 下方）——“长八边形 + 小方砖”密铺：
+      每块砖：平顶平底（半宽 s，高 ±h）、四条斜边、左右尖端各有一小段竖边（x = ±A，半高 s）
+      砖心在 (i·a, j·c)（i+j 为偶数），a = A + s，c = h + s；斜向相邻的砖共用斜边
+      小方砖（边长 2s）在 i+j 为奇数的格点上，正好卡在左右两块的尖端和上下两块的平边之间
+      每块六边形有一圈内倒角线
+    返回 (rgb, height, 贴图宽米数, 贴图高米数)
+    """
+    a, c = A + s, h + s
+    Wm, Hm = 2 * a * rep, 2 * c * rep
+    nx, ny = n, int(round(n * Hm / Wm))
+    x = (np.arange(nx) + 0.5) / nx * Wm
+    y = (np.arange(ny) + 0.5) / ny * Hm
+    X, Y = np.meshgrid(x, y)
+    px = Wm / nx
+    # 斜边外法线
+    nd = np.array([h - s, A - s]); nd = nd / np.linalg.norm(nd)
+
+    i0, j0 = np.round(X / a), np.round(Y / c)
+    best_sd = np.full(X.shape, 1e9)
+    best_i = np.zeros_like(X); best_j = np.zeros_like(X)
+    sq_d = np.full(X.shape, 1e9)
+    sq_i = np.zeros_like(X); sq_j = np.zeros_like(X)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            I, J = i0 + di, j0 + dj
+            dx, dy = np.abs(X - I * a), np.abs(Y - J * c)
+            even = (np.mod(I + J, 2) == 0)
+            # 八边形的有向距离（负 = 在砖内）
+            sd = np.maximum(np.maximum(dy - h, dx - A), nd[0] * (dx - s) + nd[1] * (dy - h))
+            sd = np.where(even, sd, 1e9)
+            closer = sd < best_sd
+            best_sd = np.where(closer, sd, best_sd)
+            best_i = np.where(closer, I, best_i); best_j = np.where(closer, J, best_j)
+            linf = np.where(even, 1e9, np.maximum(dx, dy))
+            cl = linf < sq_d
+            sq_d = np.where(cl, linf, sq_d)
+            sq_i = np.where(cl, I, sq_i); sq_j = np.where(cl, J, sq_j)
+
+    in_sq = sq_d < s
+    d_bound = np.where(in_sq, s - sq_d, np.maximum(-best_sd, 0))
+
+    grout = np.clip(_cover(np.abs(d_bound), 0.007, px), 0, 1)
+    inset = _cover(np.abs(d_bound - 0.06), 0.01, px) * (~in_sq)   # 六边形内圈倒角线
+    bevel = np.clip(d_bound / 0.06, 0, 1)
+
+    hid = _hash(np.mod(best_i, 2 * rep), np.mod(best_j, 2 * rep))
+    sid = _hash(np.mod(sq_i, 2 * rep) + 100, np.mod(sq_j, 2 * rep))
+    hex_col = _hex2rgb("#C9938A")[None, None, :] * (0.94 + 0.12 * hid[..., None])
+    sq_col = _hex2rgb("#A9626A")[None, None, :] * (0.95 + 0.08 * sid[..., None])
+    col = np.where(in_sq[..., None], sq_col, hex_col)
+    col *= (1 + 0.04 * _lowfreq_noise(X / Wm, Y / Hm, 5))[..., None]
+    col *= (0.9 + 0.1 * bevel)[..., None]
+    col = col * (1 - 0.1 * inset[..., None])
+    col = col * (1 - grout[..., None]) + _hex2rgb("#7B524F") * grout[..., None]
+
+    height = 0.3 + 0.7 * bevel ** 0.6 - 0.15 * inset
+    height = height * (1 - grout)
+    return np.clip(col, 0, 1), np.clip(height, 0, 1), Wm, Hm
+
+
+def make_image(name, arr, non_color=False):
+    """numpy 数组 → Blender 图像（打包进 .blend，不依赖外部文件）"""
+    h, w = arr.shape[:2]
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    rgba = np.concatenate([arr, np.ones((h, w, 1))], axis=2).astype(np.float32)
+    img = bpy.data.images.new(name, w, h, alpha=False)
+    img.pixels.foreach_set(rgba.ravel())
+    if non_color:
+        img.colorspace_settings.name = "Non-Color"
+    img.pack()
+    return img
+
+
+def export_images(folder, *imgs):
+    os.makedirs(folder, exist_ok=True)
+    for img in imgs:
+        img.filepath_raw = os.path.join(folder, img.name + ".png")
+        img.file_format = "PNG"
+        img.save()
 
 
 # ===========================================================================
@@ -937,6 +1163,9 @@ def stair_z(x):
     return t * STAIR_H
 
 
+ROAD_Y = -14.5    # 广场与外侧六边形砖路的分界
+
+
 def build_ground(M, root):
     C = collection("地面", root)
     P = Part("广场", C)
@@ -946,6 +1175,9 @@ def build_ground(M, root):
     P = Part("人行道", C, bevel=0.02)
     P.box_mm(-8.3, 16.5, -2.1, 0.0, 0.0, 0.07, M.sidewalk)
     P.box_mm(-8.3, 16.5, -2.3, -2.1, 0.0, 0.1, M.curb)
+    # 广场外侧的六边形砖路 + 灰色路缘石（参考截图 7 下方）
+    P.box_mm(-9.0, 40.0, -40.0, ROAD_Y - 0.3, 0.0, 0.03, M.sidewalk)
+    P.box_mm(-9.0, 40.0, ROAD_Y - 0.3, ROAD_Y, 0.0, 0.12, M.road_curb)
     P.finish()
 
 
@@ -1131,7 +1363,7 @@ def build_props(M, root):
     street_lamp(P, M, GARDEN[1] - 0.2, GARDEN[2] + 0.4, 0.0)       # 花园转角
     street_lamp(P, M, BX0 + BW + 1.0, -1.7, 0.0)                    # 主楼右侧
     street_lamp(P, M, STAIR_X0 + 3.0, STAIR_Y0 - 2.0, 0.0)          # 喷泉旁
-    street_lamp(P, M, -4.0, -13.0, 0.0)
+    street_lamp(P, M, -4.0, -12.6, 0.0)
     P.finish()
 
 
@@ -1242,6 +1474,8 @@ VIEWS = {
     # 参考图1：站在大台阶顶端往下看
     "stairs": dict(loc=(-30.0, -9.5, 13.0), target=(-3.0, -1.0, 0.5), lens=22),
     # 参考图3：从广场右前方斜俯视
+    # 参考图 7：站在广场外侧路缘石上看主楼和地砖
+    "ground": dict(loc=(1.0, -24.0, 7.0), target=(1.0, -5.0, 0.5), lens=26),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
 
@@ -1302,7 +1536,7 @@ def clear_scene():
     for coll in list(bpy.data.collections):
         bpy.data.collections.remove(coll)
     for block in (bpy.data.meshes, bpy.data.materials, bpy.data.lights, bpy.data.cameras,
-                  bpy.data.worlds, bpy.data.textures):
+                  bpy.data.worlds, bpy.data.textures, bpy.data.images):
         for item in list(block):
             block.remove(item)
 
@@ -1333,6 +1567,7 @@ def parse_args():
     p.add_argument("--outline", action="store_true")
     p.add_argument("--view", choices=tuple(VIEWS), default="front")
     p.add_argument("--part", choices=("all", "building"), default="all")
+    p.add_argument("--export-textures", help="把生成的地砖贴图另存为 PNG 到这个文件夹")
     args, _ = p.parse_known_args(argv)
     return args
 
@@ -1342,6 +1577,9 @@ def main():
     build(args.view, args.part)
     w, h = (int(v) for v in args.res.lower().split("x"))
     setup_render(args.engine, (w, h), args.samples, args.outline)
+    if args.export_textures:
+        export_images(os.path.abspath(args.export_textures),
+                      *[i for i in bpy.data.images if i.name.startswith(("广场", "六边形"))])
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
     if args.render:
