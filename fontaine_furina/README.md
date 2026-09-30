@@ -5,20 +5,25 @@
 | ![](preview_front.png) | ![](preview_stairs.png) |
 | **广场斜俯视（参考图3）** | **广场与地砖（参考图7）** |
 | ![](preview_plaza.png) | ![](preview_ground.png) |
+| **门口地砖（参考图9）** | **路对面砖路与井盖（参考图8）** |
+| ![](preview_doorstep.png) | ![](preview_road.png) |
 
 ## 文件
 - `fontaine_furina.py`：生成脚本（Blender 4.2+，在 5.0 上测试通过）
 - `fontaine_furina.blend`：生成好的场景，直接打开，小键盘 0 进相机，F12 渲染
-- `preview_*.png`：四个机位的渲染
+- `preview_*.png`：六个机位的渲染
 - `textures/`：程序生成的地砖贴图（颜色 + 高度），已打包进 .blend，这里是另存的 PNG
 
 ## 地砖（v2 新增）
 地砖是可以无缝重复的图案，所以不用建模，而是由脚本用 numpy 逐像素“画”成贴图再平铺：
 - **广场“画框”砖** `gen_plaza_tiles()`：1.7 m 大方砖转 45° 铺成菱形；每块 = 中心方块 + 两圈错缝长条砖，
   四条对角斜接线；白色细缝，大砖之间是粉褐色缝。每一小块有轻微色差，高度图让缝有凹陷感。
-- **六边形砖** `gen_hex_pavers()`：尖头长六边形 + 暗红小方砖，每块带一圈内倒角线；
-  用在主楼前的人行道和广场外侧的砖路（灰色路缘石隔开）。
-- 大小在脚本顶部 `PLAZA_TILE`，以及 `gen_hex_pavers()` 的参数 `s / A / h` 里改。
+- **玫瑰色风车砖** `gen_hex_pavers()`（v3 按近景截图重做）：四种砖——暗红小方砖（0.30 m）、浅色大方砖（0.48 m）、
+  横向和竖向的“切角长方形”六边形（带内倒角线）。横竖六边形共用长斜边，大小方砖沿对角线角碰角，
+  是旋转对称的风车排布；用在主楼门口人行道和路缘石外的砖路上。
+- **水渍**：材质里的低频噪声把局部压暗，砖路最重、人行道和广场很淡（`toon(..., stains=)`）。
+- **井盖** `manhole()`：石圈 + 铸铁盖 + 金色同心环、放射筋、中间一对弧纹；砖路上一个，门口人行道上一个。
+- 尺寸在脚本顶部：`PLAZA_TILE`（广场砖）、`HEX_G / HEX_SQ / HEX_CUT / HEX_ROT`（风车砖）。
 
 ## 命令行
 ```bash
@@ -26,6 +31,7 @@ blender -b -P fontaine_furina.py -- --view front  --render out.png
 blender -b -P fontaine_furina.py -- --view stairs --render out.png
 blender -b -P fontaine_furina.py -- --view plaza  --render out.png --save scene.blend
 blender -b -P fontaine_furina.py -- --view ground --render out.png --export-textures textures
+# 地砖近景：--view doorstep / --view road
 # 只生成主楼（调细节更快）：--part building
 ```
 

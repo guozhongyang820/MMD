@@ -166,7 +166,7 @@ def _pattern(nt, kind, scale, plane, radius=1.0):
 
 
 def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHADOW,
-         emit=0.0, sheen=None, radius=1.0, alpha=1.0, image=None):
+         emit=0.0, sheen=None, radius=1.0, alpha=1.0, image=None, stains=0.0):
     """
     卡通材质（EEVEE）：Diffuse → Shader to RGB → 柔和两段色阶 → 乘底色 → Emission
     Cycles 下自动退化为 Principled BSDF。
@@ -175,6 +175,8 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
       emit                      自发光（灯、水）
       image=dict(color=, height=, size=(宽米, 高米), rot=度, bump=强度)
                                 平铺贴图（地砖）：按世界尺寸平铺，高度图做凹凸
+                                也可以用 basis=((ux,uy),(vx,vy)) 按任意平行四边形周期平铺
+      stains                    地面水渍强度（0 = 没有）
     """
     m = bpy.data.materials.new(name)
     try:
@@ -192,25 +194,56 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
 
     if image:
         tc = N("ShaderNodeTexCoord")
-        mp = N("ShaderNodeMapping")
-        sx, sy = image["size"]
-        mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1)
-        mp.inputs["Rotation"].default_value = (0, 0, math.radians(image.get("rot", 0)))
-        L(tc.outputs["Object"], mp.inputs["Vector"])
+        if "basis" in image:
+            # 世界坐标 → 平行四边形周期坐标 (u, v)：乘以 [U V] 矩阵的逆
+            (ux, uy), (vx, vy) = image["basis"]
+            det = ux * vy - vx * uy
+            rows = ((vy / det, -vx / det), (-uy / det, ux / det))
+            comb = N("ShaderNodeCombineXYZ")
+            for axis, (r0, r1) in zip(("X", "Y"), rows):
+                dp = N("ShaderNodeVectorMath"); dp.operation = "DOT_PRODUCT"
+                L(tc.outputs["Object"], dp.inputs[0])
+                dp.inputs[1].default_value = (r0, r1, 0)
+                L(dp.outputs["Value"], comb.inputs[axis])
+            uv = comb.outputs[0]
+        else:
+            mp = N("ShaderNodeMapping")
+            sx, sy = image["size"]
+            mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1)
+            mp.inputs["Rotation"].default_value = (0, 0, math.radians(image.get("rot", 0)))
+            L(tc.outputs["Object"], mp.inputs["Vector"])
+            uv = mp.outputs[0]
         it = N("ShaderNodeTexImage")
         it.image = image["color"]
         it.interpolation = "Cubic"
-        L(mp.outputs[0], it.inputs["Vector"])
+        L(uv, it.inputs["Vector"])
         base = it.outputs["Color"]
         if image.get("height"):
             ht = N("ShaderNodeTexImage")
             ht.image = image["height"]
-            L(mp.outputs[0], ht.inputs["Vector"])
+            L(uv, ht.inputs["Vector"])
             bp = N("ShaderNodeBump")
             bp.inputs["Strength"].default_value = image.get("bump", 0.6)
             bp.inputs["Distance"].default_value = 0.01
             L(ht.outputs["Color"], bp.inputs["Height"])
             normal = bp.outputs["Normal"]
+
+    if stains > 0:
+        # 水渍：大块低频噪声 → 阈值 → 局部压暗（“意思意思”，不追求还原）
+        tcs = N("ShaderNodeTexCoord")
+        nz = N("ShaderNodeTexNoise")
+        nz.inputs["Scale"].default_value = 0.35
+        nz.inputs["Detail"].default_value = 8.0
+        nz.inputs["Roughness"].default_value = 0.65
+        L(tcs.outputs["Object"], nz.inputs["Vector"])
+        rp = N("ShaderNodeValToRGB")
+        rp.color_ramp.elements[0].position = 0.56
+        rp.color_ramp.elements[1].position = 0.68
+        L(nz.outputs["Fac"], rp.inputs["Fac"])
+        k = _math(nt, "SUBTRACT", 1.0, _math(nt, "MULTIPLY", rp.outputs["Color"], stains))
+        sc = N("ShaderNodeVectorMath"); sc.operation = "SCALE"
+        L(base, sc.inputs[0]); L(k, sc.inputs["Scale"])
+        base = sc.outputs[0]
 
     if pattern:
         f = _pattern(nt, pattern, scale, plane, radius)
@@ -315,13 +348,17 @@ class Mats:
         # 地面
         # 地砖贴图（程序生成，见 gen_plaza_tiles / gen_hex_pavers）
         pc, ph = gen_plaza_tiles()
-        hc, hh, hw_m, hh_m = gen_hex_pavers()
+        hc, hh, hu, hv = gen_hex_pavers()
+        ca, sa = math.cos(math.radians(HEX_ROT)), math.sin(math.radians(HEX_ROT))
+        hex_basis = tuple((ca * x - sa * y, sa * x + ca * y) for x, y in (hu, hv))
         self.tex = [make_image("广场地砖_颜色", pc), make_image("广场地砖_高度", ph, True),
-                    make_image("六边形砖_颜色", hc), make_image("六边形砖_高度", hh, True)]
-        self.plaza = toon("广场地砖", "#E7CDBF", image=dict(
+                    make_image("风车砖_颜色", hc), make_image("风车砖_高度", hh, True)]
+        self.plaza = toon("广场地砖", "#E7CDBF", stains=0.06, image=dict(
             color=self.tex[0], height=self.tex[1], size=(2 * PLAZA_TILE, 2 * PLAZA_TILE), rot=45, bump=0.5))
-        self.sidewalk = toon("六边形人行道", "#C9938A", image=dict(
-            color=self.tex[2], height=self.tex[3], size=(hw_m, hh_m), rot=0, bump=0.6))
+        hex_img = dict(color=self.tex[2], height=self.tex[3], basis=hex_basis, bump=0.6)
+        self.sidewalk = toon("风车砖_人行道", "#B98A86", stains=0.1, image=hex_img)
+        self.road = toon("风车砖_砖路", "#B98A86", stains=0.35, image=hex_img)
+        self.manhole = toon("井盖铸铁", "#45403B", sheen=("#7A6E60", 0.4))
         self.curb = toon("路缘石", "#E4D6CC")
         self.road_curb = toon("灰色路缘石", "#B8B6B6")
         self.step = toon("台阶", "#DEDAD4")
@@ -355,7 +392,9 @@ class Mats:
 
 PLAZA_TILE = 1.7            # 广场大方砖边长（米），贴图里放 2×2 块
 PLAZA_PX = 2048
-HEX_REPEAT = 4              # 贴图里横竖各放几个周期（周期越多，色差越不重复）
+HEX_G, HEX_SQ, HEX_CUT = 0.30, 0.48, 0.44   # 风车砖：小方砖边长 / 大方砖边长 / 六边形切角
+HEX_CELLS = 4               # 贴图里放 4×4 个周期（色差不容易看出重复）
+HEX_ROT = -45               # 整体旋转，让六边形长边平行于楼的立面
 HEX_PX = 2048
 
 
@@ -452,66 +491,64 @@ def gen_plaza_tiles(n=PLAZA_PX):
     return np.clip(col, 0, 1), np.clip(height, 0, 1)
 
 
-def gen_hex_pavers(n=HEX_PX, rep=HEX_REPEAT, s=0.15, A=0.63, h=0.36):
+def gen_hex_pavers(n=HEX_PX, g=HEX_G, G=HEX_SQ, c=HEX_CUT, K=HEX_CELLS):
     """
-    玫瑰色六边形砖（参考截图 7 下方）——“长八边形 + 小方砖”密铺：
-      每块砖：平顶平底（半宽 s，高 ±h）、四条斜边、左右尖端各有一小段竖边（x = ±A，半高 s）
-      砖心在 (i·a, j·c)（i+j 为偶数），a = A + s，c = h + s；斜向相邻的砖共用斜边
-      小方砖（边长 2s）在 i+j 为奇数的格点上，正好卡在左右两块的尖端和上下两块的平边之间
-      每块六边形有一圈内倒角线
-    返回 (rgb, height, 贴图宽米数, 贴图高米数)
-    """
-    a, c = A + s, h + s
-    Wm, Hm = 2 * a * rep, 2 * c * rep
-    nx, ny = n, int(round(n * Hm / Wm))
-    x = (np.arange(nx) + 0.5) / nx * Wm
-    y = (np.arange(ny) + 0.5) / ny * Hm
-    X, Y = np.meshgrid(x, y)
-    px = Wm / nx
-    # 斜边外法线
-    nd = np.array([h - s, A - s]); nd = nd / np.linalg.norm(nd)
+    玫瑰色风车拼砖（参考截图 8、9）——四种砖：
+      暗红小方砖（边长 g）、浅色大方砖（边长 G）、
+      横向 / 竖向六边形 = 长方形切掉左上、右下两个角（切角直角边 c），带一圈内倒角线
+    横竖六边形共用长斜边，小方砖和大方砖沿对角线角碰角，整体是旋转对称的“风车”排布。
+    周期格子 a = (G+g+c, c)，b = (c, G+g+c)，每格正好 2 块六边形 + 1 大方 + 1 小方（面积严格相等）。
 
-    i0, j0 = np.round(X / a), np.round(Y / c)
-    best_sd = np.full(X.shape, 1e9)
-    best_i = np.zeros_like(X); best_j = np.zeros_like(X)
-    sq_d = np.full(X.shape, 1e9)
-    sq_i = np.zeros_like(X); sq_j = np.zeros_like(X)
+    贴图覆盖 K×K 个周期的平行四边形（u, v ∈ [0,1)），材质里用 basis 把世界坐标换算成 (u, v)。
+    返回 (rgb, height, 贴图 u 方向世界向量, v 方向世界向量)
+    """
+    A1 = G + g + c
+    a = np.array([A1, c]); b = np.array([c, A1])
+    tiles = {   # 逆时针顶点
+        0: [(-g, 0), (0, 0), (0, g), (-g, g)],                                               # 小方砖
+        1: [(0, 0), (G, 0), (G + c, c), (G + c, g + c), (c, g + c), (0, g)],                  # 横向六边形
+        2: [(-g, g), (0, g), (c, g + c), (c, g + G + c), (-g + c, g + G + c), (-g, g + G)],   # 竖向六边形
+        3: [(c, g + c), (G + c, g + c), (G + c, g + c + G), (c, g + c + G)],                  # 大方砖
+    }
+    t = (np.arange(n) + 0.5) / n * K
+    U, V = np.meshgrid(t, t)
+    PX = U * a[0] + V * b[0]
+    PY = U * a[1] + V * b[1]
+    px = A1 * K / n
+    i0, j0 = np.floor(U), np.floor(V)
+    best = np.full(U.shape, 1e9)
+    btype = np.zeros(U.shape, int)
+    bi = np.zeros(U.shape); bj = np.zeros(U.shape)
     for di in (-1, 0, 1):
         for dj in (-1, 0, 1):
             I, J = i0 + di, j0 + dj
-            dx, dy = np.abs(X - I * a), np.abs(Y - J * c)
-            even = (np.mod(I + J, 2) == 0)
-            # 八边形的有向距离（负 = 在砖内）
-            sd = np.maximum(np.maximum(dy - h, dx - A), nd[0] * (dx - s) + nd[1] * (dy - h))
-            sd = np.where(even, sd, 1e9)
-            closer = sd < best_sd
-            best_sd = np.where(closer, sd, best_sd)
-            best_i = np.where(closer, I, best_i); best_j = np.where(closer, J, best_j)
-            linf = np.where(even, 1e9, np.maximum(dx, dy))
-            cl = linf < sq_d
-            sq_d = np.where(cl, linf, sq_d)
-            sq_i = np.where(cl, I, sq_i); sq_j = np.where(cl, J, sq_j)
+            qx = PX - I * a[0] - J * b[0]
+            qy = PY - I * a[1] - J * b[1]
+            for k, poly in tiles.items():
+                sd = np.full(U.shape, -1e9)          # 凸多边形有向距离（负 = 在砖内）
+                for m in range(len(poly)):
+                    (x0, y0), (x1, y1) = poly[m], poly[(m + 1) % len(poly)]
+                    ex, ey = x1 - x0, y1 - y0
+                    sd = np.maximum(sd, ((qx - x0) * ey - (qy - y0) * ex) / np.hypot(ex, ey))
+                cl = sd < best
+                best = np.where(cl, sd, best)
+                btype = np.where(cl, k, btype)
+                bi = np.where(cl, I, bi); bj = np.where(cl, J, bj)
+    d = np.maximum(-best, 0)
+    is_hex = (btype == 1) | (btype == 2)
 
-    in_sq = sq_d < s
-    d_bound = np.where(in_sq, s - sq_d, np.maximum(-best_sd, 0))
-
-    grout = np.clip(_cover(np.abs(d_bound), 0.007, px), 0, 1)
-    inset = _cover(np.abs(d_bound - 0.06), 0.01, px) * (~in_sq)   # 六边形内圈倒角线
-    bevel = np.clip(d_bound / 0.06, 0, 1)
-
-    hid = _hash(np.mod(best_i, 2 * rep), np.mod(best_j, 2 * rep))
-    sid = _hash(np.mod(sq_i, 2 * rep) + 100, np.mod(sq_j, 2 * rep))
-    hex_col = _hex2rgb("#C9938A")[None, None, :] * (0.94 + 0.12 * hid[..., None])
-    sq_col = _hex2rgb("#A9626A")[None, None, :] * (0.95 + 0.08 * sid[..., None])
-    col = np.where(in_sq[..., None], sq_col, hex_col)
-    col *= (1 + 0.04 * _lowfreq_noise(X / Wm, Y / Hm, 5))[..., None]
-    col *= (0.9 + 0.1 * bevel)[..., None]
-    col = col * (1 - 0.1 * inset[..., None])
-    col = col * (1 - grout[..., None]) + _hex2rgb("#7B524F") * grout[..., None]
-
-    height = 0.3 + 0.7 * bevel ** 0.6 - 0.15 * inset
-    height = height * (1 - grout)
-    return np.clip(col, 0, 1), np.clip(height, 0, 1), Wm, Hm
+    grout = _cover(d, 0.012, px)
+    inset = _cover(np.abs(d - 0.055), 0.01, px) * is_hex
+    bevel = np.clip(d / 0.05, 0, 1)
+    h = _hash(np.mod(bi, K), np.mod(bj, K) + 7, btype)
+    cols = np.stack([_hex2rgb("#9C5E63"), _hex2rgb("#B98A86"), _hex2rgb("#B98A86"), _hex2rgb("#C0928D")])
+    col = cols[btype] * (0.93 + 0.12 * h[..., None])
+    col *= (1 + 0.035 * _lowfreq_noise(U / K, V / K, 5))[..., None]
+    col *= (0.88 + 0.12 * bevel)[..., None]
+    col *= (1 - 0.12 * inset)[..., None]
+    col = col * (1 - grout[..., None]) + _hex2rgb("#6E4A48") * grout[..., None]
+    height = (0.3 + 0.7 * bevel ** 0.6 - 0.2 * inset) * (1 - grout)
+    return np.clip(col, 0, 1), np.clip(height, 0, 1), a * K, b * K
 
 
 def make_image(name, arr, non_color=False):
@@ -646,7 +683,7 @@ class Part:
             faces.append(bm.faces.new((a[i], a[j], b[j], b[i])))
         self._tag_faces(faces, mat, smooth)
 
-    def lathe(self, c, profile, mat, seg=24, smooth=True):
+    def lathe(self, c, profile, mat, seg=24, smooth=True, caps=True):
         """车削：profile = [(半径, 高度), ...] 自下而上"""
         bm = self.bm
         cx, cy, cz = c
@@ -669,9 +706,9 @@ class Part:
                     faces.append(bm.faces.new((A[i], A[j], B[0])))
                 else:
                     faces.append(bm.faces.new((A[i], A[j], B[j], B[i])))
-        if len(rings[0]) > 1:
+        if caps and len(rings[0]) > 1:
             faces.append(bm.faces.new(list(reversed(rings[0]))))
-        if len(rings[-1]) > 1:
+        if caps and len(rings[-1]) > 1:
             faces.append(bm.faces.new(rings[-1]))
         self._tag_faces(faces, mat, smooth)
 
@@ -1174,11 +1211,39 @@ def build_ground(M, root):
 
     P = Part("人行道", C, bevel=0.02)
     P.box_mm(-8.3, 16.5, -2.1, 0.0, 0.0, 0.07, M.sidewalk)
-    P.box_mm(-8.3, 16.5, -2.3, -2.1, 0.0, 0.1, M.curb)
+    P.box_mm(-8.3, 16.5, -2.4, -2.1, 0.0, 0.12, M.road_curb)       # 灰色路缘石
     # 广场外侧的六边形砖路 + 灰色路缘石（参考截图 7 下方）
-    P.box_mm(-9.0, 40.0, -40.0, ROAD_Y - 0.3, 0.0, 0.03, M.sidewalk)
+    P.box_mm(-9.0, 40.0, -40.0, ROAD_Y - 0.3, 0.0, 0.03, M.road)
     P.box_mm(-9.0, 40.0, ROAD_Y - 0.3, ROAD_Y, 0.0, 0.12, M.road_curb)
     P.finish()
+
+    # 井盖：砖路上一个、主楼门口人行道上一个
+    P = Part("井盖", C, bevel=0.005)
+    manhole(P, M, 6.0, -18.0, 0.03)
+    manhole(P, M, -5.2, -1.05, 0.07, r=0.45)
+    P.finish()
+
+
+def manhole(P, M, x, y, z, r=0.55):
+    """枫丹井盖：石圈 + 铸铁盖 + 金色同心环、放射筋、中间一对相背的弧形纹"""
+    R = r + 0.2
+    P.lathe((x, y, z), [(R, 0.0), (R, 0.02), (R - 0.03, 0.035), (r + 0.01, 0.035), (r + 0.01, 0.0)],
+            M.curb, seg=40, caps=False)
+    P.cyl((x, y, z + 0.015), r, 0.03, M.manhole, seg=40)
+    for r0, r1 in ((r - 0.07, r - 0.02), (r * 0.52, r * 0.6)):
+        P.lathe((x, y, z + 0.03), [(r1, 0.0), (r1, 0.012), (r0, 0.012), (r0, 0.0)], M.gold_dark, seg=40,
+                caps=False)
+    for k in range(16):                                   # 放射筋（齿轮感）
+        a = k / 16 * math.tau
+        p0 = (x + math.cos(a) * r * 0.64, y + math.sin(a) * r * 0.64, z + 0.036)
+        p1 = (x + math.cos(a) * (r - 0.1), y + math.sin(a) * (r - 0.1), z + 0.036)
+        P.beam(p0, p1, 0.035, 0.012, M.gold_dark)
+    for side in (0, math.pi):                            # 中心一对弧
+        pts = [(x + math.cos(side + t) * r * 0.3, y + math.sin(side + t) * r * 0.3)
+               for t in (math.radians(v) for v in range(-70, 71, 20))]
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            P.beam((ax, ay, z + 0.038), (bx, by, z + 0.038), 0.05, 0.014, M.gold_dark)
+    P.beam((x - r * 0.3, y, z + 0.04), (x + r * 0.3, y, z + 0.04), 0.05, 0.014, M.gold_dark)
 
 
 def build_stairs(M, root):
@@ -1476,6 +1541,10 @@ VIEWS = {
     # 参考图3：从广场右前方斜俯视
     # 参考图 7：站在广场外侧路缘石上看主楼和地砖
     "ground": dict(loc=(1.0, -24.0, 7.0), target=(1.0, -5.0, 0.5), lens=26),
+    # 参考图 9：门口俯视（人行道风车砖、路缘石、广场砖）
+    "doorstep": dict(loc=(-1.2, -5.2, 4.6), target=(-0.3, -0.9, 0.0), lens=24),
+    # 参考图 8：路缘石另一侧的砖路和井盖
+    "road": dict(loc=(3.0, -12.8, 4.2), target=(5.2, -17.2, 0.0), lens=24),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
 
@@ -1579,7 +1648,7 @@ def main():
     setup_render(args.engine, (w, h), args.samples, args.outline)
     if args.export_textures:
         export_images(os.path.abspath(args.export_textures),
-                      *[i for i in bpy.data.images if i.name.startswith(("广场", "六边形"))])
+                      *[i for i in bpy.data.images if i.name.startswith(("广场", "风车"))])
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
     if args.render:
