@@ -1622,25 +1622,30 @@ def flower_pot(P, M, x, y, z):
                    0.018, 0.012, M.pot)
     # 植物
     zs = z + 0.68
-    for k in range(6):
-        a = k / 6 * math.tau + rng.uniform(-0.3, 0.3)
+    for _ in range(14):                                 # 贴着土的一圈叶子
+        a = rng.uniform(0, math.tau)
+        q = Vector((x + math.cos(a) * rng.uniform(0.05, 0.3), y + math.sin(a) * rng.uniform(0.05, 0.3), zs))
+        leaf_card(P, q, Vector((math.cos(a), math.sin(a), rng.uniform(0.3, 1.0))).normalized(),
+                  rng.uniform(0.14, 0.2), 0.4, rng.choice(M.leaves[1:]), rng)
+    for k in range(7):
+        a = k / 7 * math.tau + rng.uniform(-0.3, 0.3)
         r0 = rng.uniform(0.05, 0.22)
         base = Vector((x + math.cos(a) * r0, y + math.sin(a) * r0, zs))
-        h = rng.uniform(0.45, 0.95)
+        h = rng.uniform(0.3, 0.65)
         lean = Vector((math.cos(a), math.sin(a), 0)) * rng.uniform(0.08, 0.25)
         pts = [base + lean * (t ** 1.5) + Vector((0, 0, h * t)) for t in (0.0, 0.35, 0.7, 1.0)]
         for q0, q1 in zip(pts, pts[1:]):
             P.beam(q0, q1, 0.018, 0.018, M.leaves[1])
-        for t in (0.2, 0.4, 0.6, 0.8):                  # 对生长叶
+        for t in (0.15, 0.3, 0.45, 0.6, 0.75, 0.9):      # 对生长叶
             q = base + lean * (t ** 1.5) + Vector((0, 0, h * t))
             b = rng.uniform(0, math.tau)
             for s_ in (0, math.pi):
                 d = Vector((math.cos(b + s_), math.sin(b + s_), rng.uniform(0.2, 0.7))).normalized()
-                leaf_card(P, q, d, rng.uniform(0.12, 0.18), 0.35, rng.choice(M.leaves[1:]), rng)
-        if k < 5:
+                leaf_card(P, q, d, rng.uniform(0.12, 0.17) * (1.2 - t * 0.5), 0.42, rng.choice(M.leaves[1:]), rng)
+        if k < 6:
             tip = pts[-1]
-            petal_flower(P, tip, Vector((lean.x * 2, lean.y * 2, 1)).normalized(), rng.uniform(0.09, 0.13),
-                         M.petal_cream, M.flower_eye, rng, n_pet=8, cup=0.6)
+            petal_flower(P, tip, Vector((lean.x * 2, lean.y * 2, 1)).normalized(), rng.uniform(0.11, 0.15),
+                         M.petal_cream, M.flower_eye, rng, n_pet=8, cup=0.4)
         else:
             P.ico(pts[-1], 0.035, M.petal_cream, scale=(1, 1, 1.5), sub=1)
 
@@ -1703,12 +1708,13 @@ def grass_tuft(P, p, rng, mats, h=(0.18, 0.38)):
 
 def bell_flower(P, M, p, rng):
     """草地里垂头的小白花：细茎 + 朝下的小钟形"""
-    h = rng.uniform(0.25, 0.45)
+    h = rng.uniform(0.35, 0.6)
     a = rng.uniform(0, math.tau)
-    top = Vector(p) + Vector((math.cos(a) * 0.06, math.sin(a) * 0.06, h))
-    P.beam(p, top, 0.012, 0.012, M.blades[0])
-    P.cyl(top - Vector((math.cos(a) * -0.03, math.sin(a) * -0.03, 0.04)), 0.045, 0.07, M.flower_white, seg=6,
-          r2=0.015, smooth=False)
+    lean = Vector((math.cos(a), math.sin(a), 0))
+    top = Vector(p) + lean * 0.08 + Vector((0, 0, h))
+    P.beam(p, top, 0.01, 0.01, M.blades[0])
+    P.beam(top, top + lean * 0.05 - Vector((0, 0, 0.03)), 0.008, 0.008, M.blades[0])
+    P.cyl(top + lean * 0.055 - Vector((0, 0, 0.06)), 0.028, 0.045, M.flower_white, seg=6, r2=0.01, smooth=False)
 
 
 def scatter_points(ob, density, rng, min_nz=-1.0):

@@ -13,8 +13,10 @@
 | ![](preview_corner.png) | ![](preview_tower.png) |
 | **圆塔底座（参考图19）** | **仰看台阶与流水槽（参考图23）** |
 | ![](preview_tower_close.png) | ![](preview_stairs_up.png) |
-| **八角喷泉（参考图24）** | |
-| ![](preview_fountain.png) | |
+| **八角喷泉（参考图24）** | **门口花盆（参考图25）** |
+| ![](preview_fountain.png) | ![](preview_pot.png) |
+| **花园植物（参考图26）** | |
+| ![](preview_garden.png) | |
 
 ## 文件
 - `fontaine_furina.py`：生成脚本（Blender 4.2+，在 5.0 上测试通过）
@@ -94,8 +96,18 @@ blender -b -P fontaine_furina.py -- --view ground --render out.png --export-text
 - 台阶另一侧花坛加高到 2 m（`SOUTH_BED_H`）；顶部平台两股小喷泉
 - 机位：`--view stairs_up`、`--view fountain`
 
+## 植物（v9，参考截图 25、26）
+- **叶片 / 草地贴图** `gen_foliage()`：几千片叠放的尖叶（随机方向、叶尖亮叶根暗、叶脉、描边），六面投影包在树篱、灌木、草地上
+- **树篱** `leaf_skin()`：在（带修改器的）表面按面积撒外翻叶片，轮廓毛茸茸
+- **草地** `grass_skin()`：顶面撒草叶簇和垂头小白花
+- **黄花丛** `flower_bush()`：叶片圆顶 + 外翻叶片 + 上半部五瓣小黄花
+- **柏树** `cypress()` / `frond()`：火焰形深色树芯 + 几百片锯齿边羽状叶片，向外向上翘，越往上越亮
+- **门口花盆** `flower_pot()`：十二棱石座 + 外敞盆身（两道凸环夹交叉斜纹）+ 深色土 + 对生长叶的茎和乳白尖瓣花
+- 机位：`--view pot`、`--view garden`
+
 ## 已知的简化 / 下一步可以细化的地方
 - 台阶顶部平台之后游戏里还有第二段台阶，目前只做到平台
+- 路灯还是早期的简单金色款，游戏里是六角形带蓝玻璃的灯笼
 - 主楼后面、塔后面的城墙目前只是带扶壁的大墙，游戏里的具体造型需要截图参考
 - 圆塔顶部、旗幡的真实形状和挂法
 - 台阶顶端平台连到哪里（参考图里看不到）
