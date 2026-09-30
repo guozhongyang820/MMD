@@ -79,6 +79,11 @@ def _coords(nt, plane, radius=1.0):
         L(sep.outputs["X"], add.inputs[0]); L(sep.outputs["Y"], add.inputs[1])
         L(add.outputs[0], comb.inputs["X"])
         L(sep.outputs["Z"], comb.inputs["Y"])
+    elif plane == "WN":
+        sub = N("ShaderNodeMath"); sub.operation = "SUBTRACT"
+        L(sep.outputs["X"], sub.inputs[0]); L(sep.outputs["Y"], sub.inputs[1])
+        L(sub.outputs[0], comb.inputs["X"])
+        L(sep.outputs["Z"], comb.inputs["Y"])
     elif plane == "CYL":
         at = N("ShaderNodeMath"); at.operation = "ARCTAN2"
         L(sep.outputs["Y"], at.inputs[0]); L(sep.outputs["X"], at.inputs[1])
@@ -211,7 +216,10 @@ def toon(name, color, pattern=None, scale=1.0, plane="W", dark=0.85, shadow=SHAD
             sx, sy = image["size"]
             mp.inputs["Scale"].default_value = (1 / sx, 1 / sy, 1)
             mp.inputs["Rotation"].default_value = (0, 0, math.radians(image.get("rot", 0)))
-            L(tc.outputs["Object"], mp.inputs["Vector"])
+            if image.get("plane", "XY") != "XY":        # 墙面：W = (x+y, z)，WN = (x−y, z)
+                L(_coords(nt, image["plane"]), mp.inputs["Vector"])
+            else:
+                L(tc.outputs["Object"], mp.inputs["Vector"])
             uv = mp.outputs[0]
         it = N("ShaderNodeTexImage")
         it.image = image["color"]
@@ -328,10 +336,21 @@ class Mats:
 
     def __init__(self):
         # 主楼
-        self.sand = toon("砂岩墙", "#EBC896", "bricks", 0.55, "W", 0.9)
+        # 墙面石块贴图（程序生成）：砂岩大块 + 白石小块
+        sc_, sh_ = gen_ashlar(seed=1)
+        wc_, wh_ = gen_ashlar(n=1024, W=4.0, H=2.4, rows=(0.3, 0.42), widths=(0.4, 0.9), base="#EEE7DB",
+                              lighter="#F2ECE3", darker="#E8E0D3", joint="#D3C9BB", bevel=0.025, seed=2)
+        self.wall_tex = [make_image("砂岩墙_颜色", sc_), make_image("砂岩墙_高度", sh_, True),
+                         make_image("白石墙_颜色", wc_), make_image("白石墙_高度", wh_, True)]
+        sand_img = lambda pl: dict(color=self.wall_tex[0], height=self.wall_tex[1], size=(8.0, 4.0), plane=pl, bump=0.5)
+        white_img = lambda pl: dict(color=self.wall_tex[2], height=self.wall_tex[3], size=(4.0, 2.4), plane=pl, bump=0.4)
+        self.sand = toon("砂岩墙", "#EAC28F", image=sand_img("W"))
+        self.sand_n = toon("砂岩墙_斜", "#EAC28F", image=sand_img("WN"))
         self.stone = toon("白石", "#EEE7DA")
-        self.stone_block = toon("白石_分块", "#EEE7DA", "bricks", 0.45, "W", 0.93)
-        self.stone_pier = toon("白石_墩", "#EDE5D8", "bricks", 0.95, "W", 0.92)
+        self.stone_block = toon("白石_分块", "#EEE7DA", image=white_img("W"))
+        self.stone_pier = toon("白石_墩", "#EDE5D8", image=white_img("W"))
+        self.stone_pier_n = toon("白石_墩_斜", "#EDE5D8", image=white_img("WN"))
+        self.scallop = toon("拱纹细石条", "#E6DED1", "scallop", 0.14, "W", 0.9)
         self.stone_relief = toon("白石_浮雕", "#DDD3C4")
         self.dado = toon("橙砂岩墙裙", "#D9A26C", "bricks", 0.8, "W", 0.88)
         self.door_frame = toon("青铜门框", "#3B625E", sheen=("#6F9C94", 0.35))
@@ -557,6 +576,54 @@ def gen_hex_pavers(n=HEX_PX, g=HEX_G, G=HEX_SQ, c=HEX_CUT, K=HEX_CELLS):
     col = col * (1 - grout[..., None]) + _hex2rgb("#6E4A48") * grout[..., None]
     height = (0.3 + 0.7 * bevel ** 0.6 - 0.2 * inset) * (1 - grout)
     return np.clip(col, 0, 1), np.clip(height, 0, 1), a * K, b * K
+
+
+def gen_ashlar(n=2048, W=8.0, H=4.0, rows=(0.42, 0.6), widths=(0.55, 1.35), base="#EAC28F",
+               lighter="#EFCB9C", darker="#E1B682", joint="#C99D6B", bevel=0.035, seed=1):
+    """
+    错缝石块墙面贴图（砂岩 / 白石）：每行高度、每块宽度随机，行与行错缝；
+    每块有色差、边缘倒角压暗、细灰缝，另外输出高度图做凹凸。横向 W 米、竖向 H 米无缝。
+    """
+    rng = np.random.RandomState(seed)
+    nx, ny = n, int(round(n * H / W))
+    hs = []
+    while sum(hs) < H - rows[0] * 0.5:
+        hs.append(rng.uniform(*rows))
+    hs = np.array(hs) * H / sum(hs)
+    redges = np.concatenate([[0], np.cumsum(hs)])
+    x = (np.arange(nx) + 0.5) / nx * W
+    y = (np.arange(ny) + 0.5) / ny * H
+    X, Y = np.meshgrid(x, y)
+    ri = np.clip(np.searchsorted(redges, Y, "right") - 1, 0, len(hs) - 1)
+    dy = np.minimum(Y - redges[ri], redges[ri + 1] - Y)
+    dx = np.zeros_like(X)
+    bi = np.zeros_like(X)
+    for r in range(len(hs)):
+        ws = []
+        while sum(ws) < W - widths[0] * 0.5:
+            ws.append(rng.uniform(*widths))
+        ws = np.array(ws) * W / sum(ws)
+        ce = np.concatenate([[0], np.cumsum(ws)])
+        off = rng.uniform(0, W)
+        m = ri == r
+        pos = np.mod(X[m] - off, W)
+        k = np.clip(np.searchsorted(ce, pos, "right") - 1, 0, len(ws) - 1)
+        dx[m] = np.minimum(pos - ce[k], ce[k + 1] - pos)
+        bi[m] = k + r * 100
+    d = np.minimum(dx, dy)
+    h = _hash(bi, bi * 0.37 + 11)
+    h2 = _hash(bi + 5, bi * 1.7)
+    c0, cl, cd = _hex2rgb(base), _hex2rgb(lighter), _hex2rgb(darker)
+    col = c0 + (cl - c0) * np.clip(h - 0.5, 0, 1)[..., None] * 2 + (cd - c0) * np.clip(0.5 - h, 0, 1)[..., None] * 2
+    col *= (0.97 + 0.06 * h2)[..., None]
+    col *= (1 + 0.04 * _lowfreq_noise(X / W, Y / H, seed + 3))[..., None]
+    b = np.clip(d / bevel, 0, 1)
+    col *= (0.9 + 0.1 * b ** 0.7)[..., None]
+    px = W / nx
+    jn = _cover(d, 0.008, px)
+    col = col * (1 - jn[..., None]) + _hex2rgb(joint) * jn[..., None]
+    height = (0.2 + 0.8 * b ** 0.5) * (1 - jn)
+    return np.clip(col, 0, 1), np.clip(height, 0, 1)
 
 
 def make_image(name, arr, non_color=False):
@@ -891,41 +958,6 @@ def footprint(inset=0.0):
     return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
-def deco_upper_window(P, M, F, cu, zb, w=1.45, h=2.45):
-    """二层彩窗：切角窗 + 白石窗套 + 金色扇形/齿轮/竖线装饰"""
-    c = 0.32
-    inner = shift(coffin(w, h, c), cu, zb)
-    P.fpoly(F, inner, -0.05, 0.02, M.glass)                              # 玻璃
-    P.fring(F, shift(coffin(w, h, c, 0.07), cu, zb), inner, 0.0, 0.07, M.gold)   # 金色内框
-    P.fring(F, shift(coffin(w, h, c, 0.2), cu, zb),
-            shift(coffin(w, h, c, 0.07), cu, zb), 0.0, 0.16, M.stone)    # 白石窗套
-    P.fring(F, shift(coffin(w, h, c, 0.28), cu, zb), shift(coffin(w, h, c, 0.2), cu, zb), 0.0, 0.08, M.stone)
-    P.fbox(F, cu - w / 2 - 0.25, cu + w / 2 + 0.25, zb - 0.42, zb - 0.28, 0.0, 0.2, M.stone)  # 窗台
-    g = 0.045
-    D0, D1 = 0.02, 0.05
-    # 竖向金线
-    for du, z0, z1 in ((0, 0.45, h * 0.62), (-0.36, 0.3, h - 0.55), (0.36, 0.3, h - 0.55),
-                       (-0.62, c + 0.1, h - c - 0.1), (0.62, c + 0.1, h - c - 0.1)):
-        P.fbox(F, cu + du - g / 2, cu + du + g / 2, zb + z0, zb + z1, D0, D1, M.gold)
-    # 顶部扇形
-    fz = zb + h * 0.62
-    for k in range(-3, 4):
-        a = math.pi / 2 + k * 0.28
-        P.fband(F, [(cu, fz), (cu + math.cos(a) * 0.8, fz + math.sin(a) * 0.72)], g, D0, D1, M.gold)
-    P.farc(F, cu, fz, 0.52, 0.58, math.radians(12), math.radians(168), D0, D1, M.gold, 10)
-    # 底部半个齿轮（枫丹的机械元素）
-    gz = zb + 0.12
-    P.farc(F, cu, gz, 0.26, 0.36, 0, math.pi, D0, D1, M.gold, 10)
-    for k in range(7):
-        a = math.pi * (k + 0.5) / 7
-        P.fband(F, [(cu + math.cos(a) * 0.34, gz + math.sin(a) * 0.34),
-                    (cu + math.cos(a) * 0.46, gz + math.sin(a) * 0.46)], 0.09, D0, D1, M.gold)
-    # 横向金线 + 两侧阶梯纹
-    P.fbox(F, cu - w / 2 + 0.1, cu + w / 2 - 0.1, zb + h * 0.33, zb + h * 0.33 + g, D0, D1, M.gold)
-    for s in (-1, 1):
-        P.fband(F, [(cu + s * 0.36, zb + h - 0.55), (cu + s * 0.62, zb + h - 0.85)], g, D0, D1, M.gold)
-
-
 def ground_window_bay(P, M, F, l, r):
     """
     一层大窗整跨（参考截图 14 左）：
@@ -1010,15 +1042,15 @@ def door_portal(P, M, F, cu):
     """
     # 石柱
     for s_ in (-1, 1):
-        pu = cu + s_ * 1.38
+        pu = cu + s_ * 1.3
         P.fbox(F, pu - 0.31, pu + 0.31, 0.0, 0.22, 0.0, 0.64, M.stone)
         P.fbox(F, pu - 0.26, pu + 0.26, 0.22, 3.6, 0.0, 0.56, M.stone_pier)
         P.fbox(F, pu - 0.32, pu + 0.32, 2.72, 2.92, 0.0, 0.64, M.stone)
         P.fbox(F, pu - 0.29, pu + 0.29, 2.66, 2.72, 0.0, 0.6, M.stone)
     # 深青色门框
-    P.fbox(F, cu - 1.12, cu + 1.12, 0.0, 3.62, 0.0, 0.14, M.door_frame)
-    for k in range(27):                                   # 门楣竖向凹槽
-        u = cu - 1.04 + k * 0.08
+    P.fbox(F, cu - 1.05, cu + 1.05, 0.0, 3.62, 0.0, 0.14, M.door_frame)
+    for k in range(26):                                   # 门楣竖向凹槽
+        u = cu - 1.0 + k * 0.08
         P.fbox(F, u - 0.018, u + 0.018, 2.9, 3.62, 0.14, 0.17, M.door_dark)
     for u0, u1, z0, z1 in ((0.98, 0.98, 2.6, 2.8), (0.64, 0.64, 2.8, 3.0), (0.38, 0.38, 3.0, 3.2)):
         P.fbox(F, cu - u0, cu + u1, z0, z1, 0.14, 0.2, M.door_frame)                 # 阶梯轮廓
@@ -1068,10 +1100,10 @@ def door_portal(P, M, F, cu):
         P.fbox(F, u0 - 0.12, u0 - 0.09, 0.3, 0.6, 0.14, 0.18, M.gold)
         P.fbox(F, u0 + 0.09, u0 + 0.12, 0.3, 0.6, 0.14, 0.18, M.gold)
     # 篮柄拱雨棚
-    hw, zh, rise, th, dep = 1.95, 3.6, 0.55, 0.42, 1.0
+    hw, zh, rise, th, dep = 1.8, 3.6, 0.55, 0.42, 1.0
     n = 28
     us = [-hw + 2 * hw * i / n for i in range(n + 1)]
-    zbot = lambda u: zh + rise * max(0.0, 1 - (u / 1.25) ** 2) ** 0.6
+    zbot = lambda u: zh + rise * max(0.0, 1 - (u / 1.15) ** 2) ** 0.6
     for a, b in zip(us, us[1:]):
         P.fpoly(F, [(cu + a, zbot(a)), (cu + b, zbot(b)), (cu + b, zbot(b) + th), (cu + a, zbot(a) + th)],
                 0.0, dep, M.stone_pier)
@@ -1178,7 +1210,7 @@ def upper_pier(P, M, F, cu, w=0.95):
     P.fbox(F, cu - 0.03, cu + 0.03, zc + 0.45, zc + 0.95, d + 0.12, d + 0.15, M.gold_dark)
 
 
-def bookstall(P, M, F, cu, w=3.2):
+def bookstall(P, M, F, cu, w=2.75):
     """粉色遮阳篷书报摊（参考截图 15）：卷筒 + 斜篷布 + 方形条纹垂片 + 青色立柱与弧撑 + 两个报刊架 + 小书箱"""
     hw = w / 2
     zr, dr = 3.0, 0.36                 # 卷筒底高、卷筒外伸
@@ -1237,11 +1269,11 @@ def bookstall(P, M, F, cu, w=3.2):
             P.beam(a, b, 0.07, 0.07, M.teal_frame)
     # 报刊架 ×2
     papers = M.papers
-    for rc in (cu - 0.45, cu + 0.7):
-        P.fbox(F, rc - 0.38, rc + 0.38, 0.12, 1.85, 0.04, 0.1, M.teal_frame)
+    for rc in (cu - 0.42, cu + 0.5):
+        P.fbox(F, rc - 0.36, rc + 0.36, 0.12, 1.85, 0.04, 0.1, M.teal_frame)
         for s_ in (-1, 1):
-            P.fbox(F, rc + s_ * 0.38 - 0.04, rc + s_ * 0.38 + 0.04, 0.0, 1.95, 0.04, 0.6, M.teal_frame)
-        P.fbox(F, rc - 0.42, rc + 0.42, 1.85, 1.95, 0.04, 0.6, M.teal_frame)
+            P.fbox(F, rc + s_ * 0.36 - 0.04, rc + s_ * 0.36 + 0.04, 0.0, 1.95, 0.04, 0.6, M.teal_frame)
+        P.fbox(F, rc - 0.4, rc + 0.4, 1.85, 1.95, 0.04, 0.6, M.teal_frame)
         P.fpoly(F, [(rc - 0.3, 1.95), (rc + 0.3, 1.95), (rc + 0.15, 2.1), (rc - 0.15, 2.1)], 0.3, 0.36, M.teal_frame)
         P.fbox(F, rc - 0.42, rc + 0.42, 0.0, 0.15, 0.04, 0.64, M.teal_frame)
         for z in (0.2, 0.62, 1.04, 1.46):
@@ -1258,6 +1290,61 @@ def bookstall(P, M, F, cu, w=3.2):
                 lambda u, t_, t: F.p(u, 0.3 + 0.35 * t_, 1.05 + 0.25 * t_ + 0.02 * t))
 
 
+def upper_bay(P, M, F, l, r):
+    """
+    二层一跨（参考截图 17 / 放大图）：
+      切角彩窗（上下四角斜切）+ 白石窗套（顶部带台阶“肩”）+ 窗台
+      彩窗：内金边、阶梯轮廓、喷泉扇 + 杯、主干与两侧竖线、向上张开的斜线、底部半齿轮（辐条 + 轮毂）
+      窗顶两根拱纹细石条 + 两端斜落到壁柱的梯形眉线
+    """
+    cu = (l + r) / 2
+    w, h, c = 1.3, 2.45, 0.3
+    zb = Z_BELT1 + 0.32
+    win = shift(coffin(w, h, c), cu, zb)
+    P.fpoly(F, win, -0.04, 0.02, M.glass)
+    P.fpoly(F, shift([(-0.2, 0.5), (0.2, 0.5), (0.2, h - 0.5), (0.12, h - 0.3), (-0.12, h - 0.3), (-0.2, h - 0.5)],
+                     cu, zb), 0.02, 0.025, M.glass_light)
+    # 窗套：白石内框 + 外台阶框 + 顶部“肩”
+    P.fring(F, shift(coffin(w, h, c, 0.14), cu, zb), win, 0.0, 0.15, M.stone)
+    P.fring(F, shift(coffin(w, h, c, 0.24), cu, zb), shift(coffin(w, h, c, 0.14), cu, zb), 0.0, 0.08, M.stone)
+    for s_ in (-1, 1):
+        P.fbox(F, cu + s_ * (w / 2 + 0.1) - 0.1, cu + s_ * (w / 2 + 0.1) + 0.1, zb + h - 0.06, zb + h + 0.24,
+               0.0, 0.08, M.stone)
+    P.fbox(F, cu - w / 2 - 0.3, cu + w / 2 + 0.3, Z_BELT1, zb - 0.14, 0.0, 0.14, M.stone)       # 窗台
+    # 彩窗金线
+    D0, D1, g = 0.02, 0.045, 0.03
+    G = lambda pts, t=g: P.fband(F, [(cu + a, zb + b) for a, b in pts], t, D0, D1, M.gold)
+    P.fring(F, shift(coffin(w, h, c, -0.05), cu, zb), shift(coffin(w, h, c, -0.08), cu, zb), D0, D1, M.gold)
+    for s_ in (-1, 1):
+        G([(s_ * 0.36, 0.55), (s_ * 0.36, h - 0.8), (s_ * 0.27, h - 0.8), (s_ * 0.27, h - 0.58),
+           (s_ * 0.17, h - 0.58), (s_ * 0.17, h - 0.38), (0, h - 0.38)])
+        G([(s_ * 0.09, 0.5), (s_ * 0.09, h * 0.56)])
+        G([(s_ * 0.2, 0.52), (s_ * (w / 2 - 0.1), 0.95)])
+        G([(s_ * 0.24, 0.72), (s_ * (w / 2 - 0.1), 1.12)])
+    G([(0, 0.42), (0, h * 0.62)], 0.05)
+    P.fpoly(F, shift([(-0.14, h * 0.66), (0.14, h * 0.66), (0.05, h * 0.6), (-0.05, h * 0.6)], cu, zb), D0, D1, M.gold)
+    for k in range(-3, 4):                              # 喷泉扇
+        a = math.pi / 2 + k * 0.22
+        G([(0, h * 0.66), (math.cos(a) * 0.3, h * 0.66 + math.sin(a) * 0.36)], 0.022)
+    gz = 0.1                                             # 半齿轮
+    P.farc(F, cu, zb + gz, 0.2, 0.27, 0, math.pi, D0, D1, M.gold, 10)
+    P.farc(F, cu, zb + gz, 0.0, 0.07, 0, math.pi, D0, D1, M.gold, 6)
+    for k in range(7):
+        a = math.pi * (k + 0.5) / 7
+        G([(math.cos(a) * 0.25, gz + math.sin(a) * 0.25), (math.cos(a) * 0.35, gz + math.sin(a) * 0.35)], 0.07)
+    for a in (math.pi / 4, math.pi / 2, 3 * math.pi / 4):
+        G([(math.cos(a) * 0.07, gz + math.sin(a) * 0.07), (math.cos(a) * 0.2, gz + math.sin(a) * 0.2)], 0.025)
+    # 窗顶拱纹细石条 + 梯形眉线
+    zt = zb + h + 0.24
+    zc = min(zt + 0.35, Z_CORNICE - 0.12)
+    for s_ in (-1, 1):
+        u = cu + s_ * 0.34
+        P.fbox(F, u - 0.07, u + 0.07, zt - 0.02, zc - 0.05, 0.0, 0.07, M.scallop)
+    P.fband(F, [(l, zc - 0.5), (l + 0.42, zc), (r - 0.42, zc), (r, zc - 0.5)], 0.15, 0.0, 0.12, M.stone)
+    P.fband(F, [(l, zc - 0.62), (l + 0.46, zc - 0.13), (r - 0.46, zc - 0.13), (r, zc - 0.62)], 0.03, 0.0, 0.06,
+            M.stone_relief)
+
+
 def facade(P, M, F, width, bays, pil_w=0.9):
     """
     一整面立面。bays 是每个开间一层/二层放什么：
@@ -1265,10 +1352,10 @@ def facade(P, M, F, width, bays, pil_w=0.9):
       upper : 'window' 二层彩窗 / None
     """
     n = len(bays)
-    inner = width - 2 * pil_w * 0.6
-    bw = inner / n
-    centers = [pil_w * 0.6 + bw * (i + 0.5) for i in range(n)]
-    pils = [pil_w * 0.5 + 0.1] + [pil_w * 0.6 + bw * i for i in range(1, n)] + [width - pil_w * 0.5 - 0.1]
+    edge = TURRET_IN + pil_w * 0.5          # 两端壁柱紧贴转角柱
+    bw = (width - 2 * edge) / n
+    centers = [edge + bw * (i + 0.5) for i in range(n)]
+    pils = [edge + bw * i for i in range(n + 1)]
     for i, (cu, bay) in enumerate(zip(centers, bays)):
         g, up = bay
         l, r = cu - bw / 2 + pil_w * 0.45, cu + bw / 2 - pil_w * 0.45
@@ -1282,11 +1369,39 @@ def facade(P, M, F, width, bays, pil_w=0.9):
         else:
             P.fbox(F, l, r, Z_PLINTH, 1.3, 0.0, 0.02, M.dado)
         if up == "window":
-            deco_upper_window(P, M, F, cu, Z_BELT1 + 0.55)
+            upper_bay(P, M, F, cu - bw / 2 + pil_w * 0.42, cu + bw / 2 - pil_w * 0.42)
     for cu in pils:
         lower_pier(P, M, F, cu, pil_w)
         upper_pier(P, M, F, cu, pil_w)
     return centers
+
+
+TURRET_IN, TURRET_OUT, TURRET_CHAMFER = 1.6, 0.35, 1.0   # 转角柱：向内占 / 向外凸 / 斜切
+
+
+def corner_turret(P, M, cx, cy, sx, sy):
+    """
+    楼角的八角形砂岩转角柱（参考截图 17、18）：切角的砂岩大石块体，夹在两个立面的白石壁柱之间；
+    腰线、檐口高度各绕一圈多边形厚白石板，脚下一圈白石勒脚。
+    (cx, cy) = 楼角，sx / sy = 楼角向外的方向（±1）
+    """
+    T, o, k = TURRET_IN, TURRET_OUT, TURRET_CHAMFER
+
+    def poly(e):
+        pts = [(-T, -T), (o + e, -T), (o + e, o - k + e * 0.41), (o - k + e * 0.41, o + e), (-T, o + e)]
+        return [(cx + sx * a, cy + sy * b) for a, b in pts]
+
+    def band(e, z0, z1, mat):
+        P.prism(poly(e), mat, lambda x, y, t: (x, y, z0 + (z1 - z0) * t))
+
+    # 斜面的方向决定用哪种贴图坐标，避免石块被拉伸
+    diag = sx * sy > 0
+    band(0.0, 0.0, Z_EAVE - 0.05, M.sand_n if diag else M.sand)
+    band(0.1, 0.0, 0.25, M.stone)
+    band(0.18, Z_BELT0 - 0.05, Z_BELT1 + 0.05, M.stone_pier_n if diag else M.stone_pier)
+    band(0.24, Z_BELT0 - 0.12, Z_BELT0 - 0.05, M.stone)
+    band(0.3, Z_CORNICE - 0.05, Z_EAVE, M.stone_pier_n if diag else M.stone_pier)
+    band(0.36, Z_EAVE - 0.12, Z_EAVE + 0.02, M.stone)
 
 
 def build_building(M, root):
@@ -1307,7 +1422,7 @@ def build_building(M, root):
     P = Part("主楼_屋顶", C, bevel=0.02)
     P.sweep(footprint(), [(0.0, Z_CORNICE), (0.1, Z_CORNICE), (0.1, Z_CORNICE + 0.15), (0.28, Z_CORNICE + 0.3),
                           (0.3, Z_CORNICE + 0.5), (0.48, Z_CORNICE + 0.62), (0.48, Z_EAVE),
-                          (0.0, Z_EAVE)], M.stone)
+                          (0.0, Z_EAVE)], M.stone_block)
     roof_prof = [(0.25, Z_EAVE), (0.18, Z_EAVE + 0.25), (-0.25, Z_EAVE + 1.2), (-0.8, Z_EAVE + 1.95),
                  (-1.4, Z_EAVE + 2.45), (-ROOF_IN, Z_ROOF)]
     P.sweep(footprint(), roof_prof, M.slate)
@@ -1345,6 +1460,13 @@ def build_building(M, root):
         P.beam(a.co, b.co, 0.1, 0.1, M.metal)
     for a, b in zip(base, base[1:] + base[:1]):
         P.beam(a.co, b.co, 0.12, 0.12, M.metal)
+    P.finish()
+
+    # 四个楼角的八角转角柱
+    P = Part("主楼_转角柱", C, bevel=0.03)
+    for cx, cy, sx_, sy_ in ((BX0, BY0, -1, -1), (BX0 + BW, BY0, 1, -1),
+                             (BX0, BY0 + BD, -1, 1), (BX0 + BW, BY0 + BD, 1, 1)):
+        corner_turret(P, M, cx, cy, sx_, sy_)
     P.finish()
 
     # 立面装饰
@@ -1748,6 +1870,8 @@ VIEWS = {
     # 参考图 14/15：正对大门和书报摊的近景
     "facade": dict(loc=(2.2, -8.2, 1.9), target=(2.2, 0.0, 2.6), lens=26),
     # 参考图 13：从书报摊旁斜着仰看立面
+    # 参考图 17：从左边楼角往上看二层和转角柱
+    "corner": dict(loc=(-12.5, -6.5, 3.6), target=(-1.5, 0.0, 6.6), lens=24),
     "facade_side": dict(loc=(5.6, -2.1, 2.6), target=(-4.0, 0.3, 5.3), lens=22),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
@@ -1809,7 +1933,7 @@ def clear_scene():
     for coll in list(bpy.data.collections):
         bpy.data.collections.remove(coll)
     for block in (bpy.data.meshes, bpy.data.materials, bpy.data.lights, bpy.data.cameras,
-                  bpy.data.worlds, bpy.data.textures, bpy.data.images):
+                  bpy.data.worlds, bpy.data.textures, bpy.data.images):  # noqa
         for item in list(block):
             block.remove(item)
 
@@ -1852,7 +1976,7 @@ def main():
     setup_render(args.engine, (w, h), args.samples, args.outline)
     if args.export_textures:
         export_images(os.path.abspath(args.export_textures),
-                      *[i for i in bpy.data.images if i.name.startswith(("广场", "风车"))])
+                      *[i for i in bpy.data.images if i.name.startswith(("广场", "风车", "砂岩墙", "白石墙"))])
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
     if args.render:
