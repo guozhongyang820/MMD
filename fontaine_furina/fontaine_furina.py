@@ -1544,12 +1544,12 @@ ROAD_Y = -14.5    # 广场与外侧六边形砖路的分界
 def build_ground(M, root):
     C = collection("地面", root)
     P = Part("广场", C)
-    P.box_mm(-60, 60, -60, 30, -0.6, 0.0, M.plaza)
+    P.box_mm(-60, 80, -60, 70, -0.6, 0.0, M.plaza)
     P.finish()
 
     P = Part("人行道", C, bevel=0.02)
     P.box_mm(-8.3, TOWER_X, -2.1, 0.0, 0.0, 0.07, M.sidewalk)
-    P.box_mm(-8.3, TOWER_X - 4.0, -2.4, -2.1, 0.0, 0.12, M.road_curb)       # 灰色路缘石（到圆塔处转弯）
+    P.box_mm(-8.3, TOWER_X - 3.4, -2.4, -2.1, 0.0, 0.12, M.road_curb)       # 灰色路缘石（到圆塔处转弯）
     # 广场外侧的六边形砖路 + 灰色路缘石（参考截图 7 下方）
     P.box_mm(-9.0, 40.0, -40.0, ROAD_Y - 0.3, 0.0, 0.03, M.road)
     P.box_mm(-9.0, 40.0, ROAD_Y - 0.3, ROAD_Y, 0.0, 0.12, M.road_curb)
@@ -1774,8 +1774,9 @@ def build_props(M, root):
 # ===========================================================================
 
 TOWER_R = 2.8                                          # 主楼右侧圆塔半径
-TOWER_X, TOWER_Y = BX0 + BW + TURRET_OUT + TOWER_R - 0.2, 0.9
-WALL_ANG = math.radians(22)                            # 右侧大墙相对立面向后斜的角度
+TOWER_GAP = 1.4                                        # 主楼转角柱与圆塔台座之间的空隙（人行道从这里通到后面）
+TOWER_X, TOWER_Y = BX0 + BW + TURRET_OUT + TOWER_GAP + TOWER_R + 0.55, 0.9
+WALL_ANG = math.radians(72)                            # 右侧大墙 / 街道相对主楼立面往后转的角度
 SIDE_W = 1.35                                          # 圆塔脚下人行道宽度
 
 
@@ -1828,66 +1829,69 @@ def build_tower_and_right_wall(M, C):
                           (r + 0.18, 1.45), (0, 1.45)], M.tower_plinth, seg=16, smooth=False)
     P.finish(origin=(tx, ty, 0))
 
-    # ---- 弧形人行道 + 路缘石
+    # ---- 弧形人行道 + 路缘石（绕塔脚，止于花坛头）；楼与塔之间的空隙也铺人行道
     Rs = r + 0.55 + SIDE_W
-    dW = Vector((math.cos(WALL_ANG), math.sin(WALL_ANG), 0))
-    nO = Vector((math.sin(WALL_ANG), -math.cos(WALL_ANG), 0))       # 大墙朝广场的外法线
-    a0 = math.atan2(-2.25 - ty, math.sqrt(max(Rs ** 2 - (-2.25 - ty) ** 2, 0)) * -1)
-    a1 = math.atan2(nO.y, nO.x) + math.tau
+    C0 = Vector((tx, ty, 0))
+    dW = Vector((math.cos(WALL_ANG), math.sin(WALL_ANG), 0))       # 大墙走向（往后）
+    nO = Vector((math.sin(WALL_ANG), -math.cos(WALL_ANG), 0))      # 大墙朝街道的外法线
+    depth = 1.5                                                    # 花坛进深
+    wall_off = 0.5                                                 # 墙面离塔心线的距离
+    ext = math.sqrt(max(Rs ** 2 - (wall_off + depth) ** 2, 0.0))
+    vE = nO * (wall_off + depth) + dW * ext                        # 弧线终点（花坛前角）
+    a0 = math.atan2(-2.25 - ty, -math.sqrt(max(Rs ** 2 - (-2.25 - ty) ** 2, 0)))
+    a1 = math.atan2(vE.y, vE.x)
+    while a1 < a0:
+        a1 += math.tau
     P = Part("圆塔人行道", C, bevel=0.01)
     P.cyl((tx, ty, 0.035), Rs, 0.07, M.sidewalk, seg=64, smooth=False)
     ring_arc(P, tx, ty, Rs, Rs + 0.3, a0, a1, 0.0, 0.12, M.road_curb, 40)
-    Tp = Vector((tx, ty, 0)) + nO * Rs
-    L = 40.0
-    wall0 = Tp - nO * (SIDE_W + 1.6)                                  # 大墙墙脚线起点
-    xy_prism(P, [Tp[:2], (Tp + dW * L)[:2], (wall0 + dW * L)[:2], wall0[:2]], 0.0, 0.07, M.sidewalk)
-    xy_prism(P, [Tp[:2], (Tp + dW * L)[:2], (Tp + dW * L + nO * 0.3)[:2], (Tp + nO * 0.3)[:2]], 0.0, 0.12,
-             M.road_curb)
+    gx0 = BX0 + BW + TURRET_OUT
+    P.box_mm(gx0, tx - r, -2.1, 10.4, 0.0, 0.07, M.sidewalk)       # 楼与塔之间的通道
     P.finish()
 
-    # ---- 右侧斜向大墙
+    # ---- 右侧大墙（从塔心往后斜）
     P = Part("右侧大墙", C, bevel=0.05)
-    back = wall0 - nO * 8.0
-    base = wall0 - dW * 4.0
-    xy_prism(P, [base[:2], (base + dW * 60)[:2], (back + dW * 56)[:2], (back - dW * 4)[:2]], 0.0, 24.0, M.bigwall)
+    base = C0 - nO * wall_off
+    back = base - nO * 8.0
+    L = 60.0
+    xy_prism(P, [base[:2], (base + dW * L)[:2], (back + dW * L)[:2], back[:2]], 0.0, 24.0, M.bigwall_n)
     for k in range(6):                                  # 扶壁
         q = base + dW * (8 + k * 9)
         xy_prism(P, [(q - dW * 1.1)[:2], (q + dW * 1.1)[:2], (q + dW * 1.1 + nO * 0.9)[:2],
-                     (q - dW * 1.1 + nO * 0.9)[:2]], 0.0, 24.0, M.bigwall)
+                     (q - dW * 1.1 + nO * 0.9)[:2]], 0.0, 24.0, M.bigwall_n)
         xy_prism(P, [(q - dW * 1.35)[:2], (q + dW * 1.35)[:2], (q + dW * 1.35 + nO * 1.15)[:2],
                      (q - dW * 1.35 + nO * 1.15)[:2]], 0.0, 1.2, M.stone)
-        if k < 5:                                       # 拱形凹龛（阴影里的深色）
+        if k < 5:                                       # 拱形凹龛
             m = q + dW * 4.5
             Fw = Frame(m - dW * 2.0, dW, nO)
             P.fpoly(Fw, arched(3.4, 9.0, 1.7), -0.02, 0.02, M.bigwall_dark, du=2.0, dz=3.0)
             P.fring(Fw, shift(arched(3.4, 9.0, 1.7, 0.25), 2.0, 3.0), shift(arched(3.4, 9.0, 1.7), 2.0, 3.0),
                     0.0, 0.2, M.stone)
     for z in (12.0, 20.0):                              # 横向线脚
-        xy_prism(P, [base[:2], (base + dW * 60)[:2], (base + dW * 60 + nO * 0.4)[:2], (base + nO * 0.4)[:2]],
+        xy_prism(P, [base[:2], (base + dW * L)[:2], (base + dW * L + nO * 0.4)[:2], (base + nO * 0.4)[:2]],
                  z, z + 0.6, M.stone)
     P.finish()
-    q2 = wall0 + dW * 30 + nO * 1.0                     # 远处第二座圆塔
+    q2 = base + dW * 30 + nO * 1.0                      # 远处第二座圆塔
     P = Part("远处圆塔", C, bevel=0.02)
     P.lathe((q2.x, q2.y, 0), [(3.2, 0.0), (3.2, 30.0), (3.5, 30.3), (3.5, 31.0), (0, 31.0)], M.tower, seg=48)
     P.lathe((q2.x, q2.y, 0), [(3.8, 0.0), (3.8, 0.9), (3.6, 1.1), (0, 1.1)], M.tower_plinth, seg=16, smooth=False)
     P.finish(origin=(q2.x, q2.y, 0))
 
-    # ---- 主楼与圆塔之间：竖向拱纹石板
+    # ---- 圆塔左侧（朝楼与塔之间的空隙）：白石框里的竖向拱纹石板
     P = Part("拱纹石板", C, bevel=0.01)
-    Fg = Frame((BX0 + BW + TURRET_OUT - 0.2, 1.9, 0), (1, 0, 0), (0, -1, 0))
-    P.fbox(Fg, 0.0, 1.2, 0.3, 16.0, 0.0, 0.25, M.stone)
-    P.fbox(Fg, 0.15, 1.05, 0.5, 15.8, 0.25, 0.3, M.scallop_big)
+    Fg = Frame((tx - r - 0.02, ty - 0.3, 0), (0, 1, 0), (-1, 0, 0))
+    for u0 in (0.0, 1.35):
+        P.fbox(Fg, u0, u0 + 0.22, 1.45, 18.0, 0.0, 0.3, M.stone)
+    P.fbox(Fg, 0.22, 1.35, 1.45, 18.0, -0.1, 0.12, M.scallop_big)
     P.finish()
 
-    # ---- 墙脚长花坛 + 路灯 + 长椅 + 排水篦子 + 花盆
+    # ---- 墙脚长花坛（从弧线终点开始）+ 路灯 + 长椅 + 排水篦子 + 花盆 + 井盖
     P = Part("大墙花坛", C, bevel=0.03)
-    p0 = wall0 + dW * 2.2
-    p1 = wall0 + dW * 26.0
-    depth = 1.5
+    p0 = base + dW * ext
+    p1 = base + dW * 28.0
     xy_prism(P, [p0[:2], p1[:2], (p1 + nO * depth)[:2], (p0 + nO * depth)[:2]], 0.0, 0.6, M.stone)
-    xy_prism(P, [(p0 - nO * 0.05 - dW * 0.05)[:2], (p1 + dW * 0.05 - nO * 0.05)[:2],
-                 (p1 + nO * (depth + 0.08) + dW * 0.05)[:2], (p0 + nO * (depth + 0.08) - dW * 0.05)[:2]],
-             0.6, 0.7, M.curb)
+    xy_prism(P, [(p0 - dW * 0.05)[:2], (p1 + dW * 0.05)[:2], (p1 + nO * (depth + 0.08) + dW * 0.05)[:2],
+                 (p0 + nO * (depth + 0.08) - dW * 0.05)[:2]], 0.6, 0.7, M.curb)
     P.finish()
     P = Part("大墙花坛_树篱", C)
     h0, h1 = p0 + nO * 0.2 + dW * 0.2, p1 + nO * 0.2 - dW * 0.2
@@ -1895,23 +1899,54 @@ def build_tower_and_right_wall(M, C):
     P.modifiers.append(organic(0.25, 0.1, 0.6))
     P.finish()
     P = Part("大墙花坛_花", C)
-    for t in (2.2, 11.0, 19.5):
+    for t in (2.5, 11.0, 20.0):
         q = p0 + dW * t + nO * (depth * 0.55)
         flower_bush(P, M, q.x, q.y, 1.6, 0.85)
     P.finish()
     P = Part("大墙前_路灯长椅", C, bevel=0.01)
-    lamp_p = p0 + nO * (depth + 0.45) + dW * 0.2
-    street_lamp(P, M, lamp_p.x, lamp_p.y, 0.07)
-    bench(P, M, p0 + dW * 13.0 + nO * (depth + 0.75) + Vector((0, 0, 0.07)), dW, nO)
-    gp = p0 + dW * 16.0 + nO * (depth + 2.3)
-    Fr = Frame(gp, dW, Vector((0, 0, 1)))
+    lamp_p = p0 + nO * (depth + 0.35) + dW * 0.6
+    street_lamp(P, M, lamp_p.x, lamp_p.y, 0.0)
+    bench(P, M, p0 + dW * 12.0 + nO * (depth + 0.7), dW, nO)
+    gp = p0 + dW * 8.0 + nO * (depth + 0.6)
     P.beam(gp - dW * 0.7 + Vector((0, 0, 0.005)), gp + dW * 0.7 + Vector((0, 0, 0.005)), 0.45, 0.02, M.stone)
     for k in range(9):
         o = dW * (-0.6 + k * 0.15)
         P.beam(gp + o - nO * 0.17 + Vector((0, 0, 0.02)), gp + o + nO * 0.17 + Vector((0, 0, 0.02)),
                0.07, 0.012, M.grate)
-    pot = Tp + dW * 1.2 - nO * 0.4
-    flower_pot(P, M, pot.x, pot.y, 0.07)
+    pot = C0 + vE * ((Rs + 0.6) / Rs)
+    flower_pot(P, M, pot.x, pot.y, 0.0)
+    P.finish()
+    P = Part("圆塔井盖", C, bevel=0.005)
+    mh = C0 + Vector((math.cos(a0 + 0.55 * (a1 - a0)), math.sin(a0 + 0.55 * (a1 - a0)), 0)) * (r + 0.55 + 0.75)
+    manhole(P, M, mh.x, mh.y, 0.07, r=0.42)
+    P.finish()
+
+    # ---- 街道对面的弧形草坪（参考截图 22 右侧）
+    P = Part("街对面草坪_石边", C, bevel=0.03)
+    g0, g1, gn0, gn1 = 3.0, 45.0, 14.0, 30.0
+    pts_out = [base + dW * (g0 + (g1 - g0) * i / 12) + nO * (gn0 + 1.8 * math.sin(math.pi * i / 12))
+               for i in range(13)]
+    pts_in = [p + nO * (gn1 - gn0) for p in pts_out]
+    for a, b, c_, d_ in zip(pts_out, pts_out[1:], pts_in[1:], pts_in):
+        xy_prism(P, [a[:2], b[:2], c_[:2], d_[:2]], 0.0, 0.55, M.stone)
+    for a, b in zip(pts_out, pts_out[1:]):
+        xy_prism(P, [(a - nO * 1.4)[:2], (b - nO * 1.4)[:2], b[:2], a[:2]], 0.0, 0.07, M.sidewalk)
+        xy_prism(P, [(a - nO * 1.7)[:2], (b - nO * 1.7)[:2], (b - nO * 1.4)[:2], (a - nO * 1.4)[:2]], 0.0, 0.12,
+                 M.road_curb)
+    P.finish()
+    P = Part("街对面草坪", C)
+    for a, b, c_, d_ in zip(pts_out, pts_out[1:], pts_in[1:], pts_in):
+        xy_prism(P, [(a + nO * 0.25)[:2], (b + nO * 0.25)[:2], c_[:2], d_[:2]], 0.55, 0.7, M.grass)
+    P.finish()
+    P = Part("街对面_路灯长椅", C, bevel=0.01)
+    for i in (2, 6, 10):
+        q = pts_out[i] - nO * 0.5
+        street_lamp(P, M, q.x, q.y, 0.07)
+    q = pts_out[4] - nO * 0.8
+    bench(P, M, q + Vector((0, 0, 0.07)), dW, -nO)
+    for i in (1, 8):
+        q = pts_out[i] - nO * 0.7
+        flower_pot(P, M, q.x, q.y, 0.07)
     P.finish()
 
 
@@ -1921,14 +1956,14 @@ def build_backdrop(M, root):
 
     # 背后的城墙（主楼后面 + 左后方高墙）
     P = Part("城墙", C, bevel=0.05)
-    P.box_mm(-45, 45, 10.4, 16, 0.0, 34.0, M.bigwall)
-    for x in range(-40, 44, 9):
+    P.box_mm(-45, 16, 10.4, 16, 0.0, 34.0, M.bigwall)
+    for x in range(-40, 12, 9):
         P.box_mm(x - 1.0, x + 1.0, 9.6, 10.4, 0.0, 34.0, M.bigwall)            # 扶壁
         P.box_mm(x - 1.2, x + 1.2, 9.4, 10.4, 0.0, 1.5, M.stone)
     for z in (13.0, 23.0):                                                   # 横向线脚
-        P.box_mm(-45, 45, 10.0, 10.5, z, z + 0.6, M.stone)
+        P.box_mm(-45, 16, 10.0, 10.5, z, z + 0.6, M.stone)
     # 高处的拱形凹窗（阴影里的深色）
-    for x in range(-36, 44, 9):
+    for x in range(-36, 8, 9):
         P.prism(arched(4.2, 7.0, 2.1), M.bigwall_dark,
                 lambda u, z, t, x=x: (x + 4.5 + u, 10.38 - 0.02 * t, 15.0 + z))
     # 左侧台阶顶上的高台和墙
@@ -1951,7 +1986,7 @@ def build_backdrop(M, root):
 
     # 右边远处的铜顶小楼（参考图1 最右侧）
     P = Part("铜顶小楼", C, bevel=0.03)
-    x, y = 21.0, -11.0
+    x, y = 25.0, -19.0
     P.lathe((x, y, 0), [(3.2, 0.0), (3.2, 6.0), (3.5, 6.3), (3.5, 6.7), (2.9, 7.0), (2.9, 9.5), (3.2, 9.8),
                         (2.6, 11.0), (1.4, 12.2), (0.5, 12.8), (0.25, 13.6), (0.0, 13.6)], M.copper, seg=8,
             smooth=False)
@@ -2015,9 +2050,9 @@ VIEWS = {
     # 参考图 17：从左边楼角往上看二层和转角柱
     "corner": dict(loc=(-12.5, -6.5, 3.6), target=(-1.5, 0.0, 6.6), lens=24),
     # 参考图 20：从广场右前方高处俯看主楼、圆塔和右侧大墙
-    "tower": dict(loc=(2.5, -19.0, 15.0), target=(11.0, 2.0, 1.5), lens=24),
+    "tower": dict(loc=(22.0, -13.0, 16.0), target=(11.0, 5.0, 0.0), lens=24),
     # 参考图 19：书报摊旁看圆塔底座
-    "tower_close": dict(loc=(5.0, -6.0, 5.6), target=(10.6, 0.2, 1.0), lens=24),
+    "tower_close": dict(loc=(6.2, -4.8, 6.4), target=(10.2, 1.5, 0.6), lens=24),
     "facade_side": dict(loc=(5.6, -2.1, 2.6), target=(-4.0, 0.3, 5.3), lens=22),
     "plaza": dict(loc=(9.0, -20.0, 10.0), target=(-6.0, -4.0, 1.5), lens=24),
 }
