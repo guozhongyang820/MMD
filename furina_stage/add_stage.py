@@ -48,6 +48,8 @@ STAGE_FRONT_Y = -3.4     # 台口前沿
 # bunch_* 堆叠区（每隔多少米一处、挤多紧），drift 褶沿高度左右漂移，wobble 褶沿高度变深变浅
 CURTAIN_DRAPE = dict(mean_w=0.12, depth=0.11, sigma=0.3, bunch_every=3.0, bunch_amp=(0.3, 0.9),
                      drift=0.06, wobble=0.18, n_creases=200, crease_amp=(0.0015, 0.005))
+# 大幕落地堆布：forward 向台前鼓出多远，height 鼓包多高，nose 最前面折边的圆弧半径，lumps 揉皱起伏（米）
+HEM_POOL = dict(forward=0.14, forward_var=0.045, height=0.17, height_var=0.04, nose=0.026, lumps=0.014)
 PLANK_W = 0.15           # 地板条宽
 PLANK_L = 2.1            # 地板条长
 # 木纹公式的输入参数，每块板在基准值上随机浮动的比例（0.08 = ±8%）
@@ -556,9 +558,11 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
     # 每一处堆布的尺寸沿宽度缓慢变化：鼓包向前伸 Ry、高 Rz，折边圆弧半径 r，藏在下面的布长 tail
     n1, n2 = _smooth_noise(rng, x0, x1, 0.3), _smooth_noise(rng, x0, x1, 0.9)
     big = 0.5 * n1(xs) + 0.5 * n2(xs)
-    Ry = np.clip(0.065 + 0.022 * big, 0.03, 0.11)
-    Rz = np.clip(0.12 + 0.035 * _smooth_noise(rng, x0, x1, 0.45)(xs) + 0.4 * (Ry - 0.065), 0.07, 0.2)
-    r = np.clip(0.017 + 0.005 * _smooth_noise(rng, x0, x1, 0.25)(xs), 0.01, 0.026)
+    h = HEM_POOL
+    Ry = np.clip(h["forward"] + h["forward_var"] * big, h["forward"] * 0.5, h["forward"] * 1.6)
+    Rz = np.clip(h["height"] + h["height_var"] * _smooth_noise(rng, x0, x1, 0.45)(xs) + 0.4 * (Ry - h["forward"]),
+                 h["height"] * 0.55, h["height"] * 1.6)
+    r = np.clip(h["nose"] * (1.0 + 0.3 * _smooth_noise(rng, x0, x1, 0.25)(xs)), h["nose"] * 0.6, h["nose"] * 1.5)
     tail = Ry * rng.uniform(0.6, 1.0)
     yn = -Ry                                             # 折边圆弧的圆心（相对 y0；台前是 -Y）
 
@@ -608,7 +612,7 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
     lump = sum(np.sin(kx[k] * xs[None, :] + ks[k] * s[:, None] + ph[k]) for k in range(7)) / 3.0
     on_pile = np.zeros_like(BY)
     on_pile[6:n_pile] = np.sin(np.linspace(0, math.pi, n_pile - 6))[:, None]
-    C = C + on_pile * 0.008 * lump
+    C = C + on_pile * HEM_POOL["lumps"] * lump
 
     Y = y0 + off + BY + ny * C
     Z = BZ + nz * C
