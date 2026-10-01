@@ -43,7 +43,6 @@ VALANCE_TOP = 6.8
 VALANCE_BOTTOM = 5.6
 STAGE_FRONT_Y = -3.4     # 台口前沿
 PLANK_W = 0.15           # 地板条宽
-PLANK_L = 2.1            # 地板条长
 
 
 # ----------------------------------------------------------------------------
@@ -210,15 +209,27 @@ def mat_velvet(name="酒红丝绒"):
     # 大块的绒面“倒毛”明暗（丝绒被摸过的那种色块）
     patch = nb.new("ShaderNodeTexNoise", Scale=0.45, Detail=2.0, Roughness=0.5)
     nb.set(patch, "Vector", uv)
-    patch_f = nb.map_range(patch.outputs["Fac"], 0.3, 0.7, 0.86, 1.1)
+    patch_f = nb.map_range(patch.outputs["Fac"], 0.3, 0.7, 0.8, 1.14)
     streak_f = nb.map_range(streak.outputs["Fac"], 0.25, 0.75, 0.9, 1.08)
 
     lw = nb.new("ShaderNodeLayerWeight", Blend=0.42)
     facing = nb.math("POWER", lw.outputs["Facing"], 1.6)
     core = srgb("#4f0815")      # 正对时：深酒红
-    rim = srgb("#a8203c")       # 掠射时：绒光，偏玫红
+    rim = srgb("#901a34")       # 掠射时：绒光，偏玫红
     base = nb.mix(facing, core, rim)
     base = nb.mix(1.0, base, nb.combine(patch_f, patch_f, patch_f), blend="MULTIPLY")
+    # 褶谷压暗（几何里存的 fold 属性：0 = 朝观众的褶脊，1 = 最深的褶谷）
+    fold = nb.new("ShaderNodeAttribute")
+    fold.attribute_type = "GEOMETRY"
+    fold.attribute_name = "fold"
+    cav = nb.map_range(nb.math("POWER", fold.outputs["Fac"], 1.4), 0.0, 1.0, 1.08, 0.42)
+    base = nb.mix(1.0, base, nb.combine(cav, cav, cav), blend="MULTIPLY")
+    # “压绒”：绒毛倒向不同的小块，有的发亮有的发闷
+    crush = nb.new("ShaderNodeTexVoronoi", Scale=7.0, Randomness=1.0)
+    crush.feature = "F1"
+    nb.set(crush, "Vector", nb.vmath("ADD", uv, nb.vmath("SCALE", patch.outputs["Color"], scale=0.25)))
+    crush_f = nb.map_range(crush.outputs["Color"], 0.0, 1.0, 0.85, 1.12)
+    base = nb.mix(0.6, base, nb.combine(crush_f, crush_f, crush_f), blend="MULTIPLY")
     base = nb.mix(1.0, base, nb.combine(streak_f, streak_f, streak_f), blend="MULTIPLY")
 
     # 织物细节凹凸
@@ -242,7 +253,13 @@ def mat_velvet(name="酒红丝绒"):
 
 
 def mat_wood_floor(name="舞台木地板"):
-    """打蜡胡桃木长条地板：错缝铺设，每块板单独的色差/纹理偏移，板缝、木纹、棕眼、半哑光清漆。"""
+    """打蜡胡桃木长条地板，板和板之间尽量“不一样”：
+
+    * 每一列板的长度不同（0.9–2.8 m），错缝位置随机；
+    * 三种板：弦切板（教堂拱形花纹，约 60%）、径切板（细密直纹）、带节疤的弦切板（约 15%）；
+    * 约 15% 的板一侧带浅色边材；每块板的明度、冷暖、偏灰程度、清漆光泽都单独随机；
+    * 板缝、板边小倒角、每块板轻微不平（倒影会一块块断开）、棕眼、半哑光清漆上的擦拭痕迹。
+    """
     mat = new_material(name)
     nb = Nodes(mat.node_tree)
     pos = nb.new("ShaderNodeNewGeometry").outputs["Position"]
@@ -250,58 +267,85 @@ def mat_wood_floor(name="舞台木地板"):
     nb.set(sep, 0, pos)
     x, y = sep.outputs[0], sep.outputs[1]
 
-    # 板条编号：沿 X 是第几条，沿 Y 按每条随机错缝后是第几段
+    def rnd3(a, b, c):
+        n = nb.new("ShaderNodeTexWhiteNoise")
+        n.noise_dimensions = "3D"
+        nb.set(n, "Vector", nb.combine(a, b, c))
+        sc = nb.new("ShaderNodeSeparateColor")
+        nb.set(sc, 0, n.outputs["Color"])
+        return sc.outputs[0], sc.outputs[1], sc.outputs[2]
+
+    def smooth(v, a, b):
+        return nb.map_range(v, a, b, 0.0, 1.0, interp="SMOOTHSTEP")
+
+    # 板条编号：沿 X 是第几列；每列自己的板长和错缝，再算沿 Y 是第几段
     xs = nb.math("DIVIDE", x, PLANK_W)
     col = nb.math("FLOOR", xs)
     u = nb.math("SUBTRACT", xs, col)
-    stagger = nb.new("ShaderNodeTexWhiteNoise")
-    stagger.noise_dimensions = "2D"
-    nb.set(stagger, "Vector", nb.combine(col, 3.7))
-    along = nb.math("ADD", y, nb.math("MULTIPLY", stagger.outputs["Value"], PLANK_L))
-    ys = nb.math("DIVIDE", along, PLANK_L)
+    c0, c1, _ = rnd3(col, 3.7, 0.0)
+    plen = nb.map_range(c1, 0.0, 1.0, 0.9, 2.8)
+    along = nb.math("ADD", y, nb.math("MULTIPLY", c0, 3.0))
+    ys = nb.math("DIVIDE", along, plen)
     seg = nb.math("FLOOR", ys)
     v = nb.math("SUBTRACT", ys, seg)
-    rid = nb.new("ShaderNodeTexWhiteNoise")
-    rid.noise_dimensions = "3D"
-    nb.set(rid, "Vector", nb.combine(col, seg, 1.3))
-    rsep = nb.new("ShaderNodeSeparateColor")
-    nb.set(rsep, 0, rid.outputs["Color"])
-    r0, r1, r2 = rsep.outputs[0], rsep.outputs[1], rsep.outputs[2]
+    r0, r1, r2 = rnd3(col, seg, 1.3)
+    t0, t1, t2 = rnd3(col, seg, 7.9)
+    um = nb.math("MULTIPLY", nb.math("SUBTRACT", u, 0.5), PLANK_W)     # 板内横向（米，以板中线为 0）
+    vm = nb.math("MULTIPLY", v, plen)                                   # 板内纵向（米）
 
     # 板缝：离板边的距离（米）
     du = nb.math("MULTIPLY", nb.math("MINIMUM", u, nb.math("SUBTRACT", 1.0, u)), PLANK_W)
-    dv = nb.math("MULTIPLY", nb.math("MINIMUM", v, nb.math("SUBTRACT", 1.0, v)), PLANK_L)
+    dv = nb.math("MULTIPLY", nb.math("MINIMUM", v, nb.math("SUBTRACT", 1.0, v)), plen)
     dist = nb.math("MINIMUM", du, nb.math("MULTIPLY", dv, 1.4))
     seam = nb.map_range(dist, 0.0004, 0.0016, 1.0, 0.0, interp="SMOOTHSTEP")
     bevel = nb.map_range(dist, 0.0004, 0.004, 1.0, 0.0, interp="SMOOTHSTEP")
 
-    # 木纹坐标：每块板随机平移，沿板长方向拉长
+    plain = nb.math("LESS_THAN", t0, 0.62)                              # 弦切板
+    knot_on = nb.math("MULTIPLY", nb.math("LESS_THAN", t1, 0.24), plain)
+    seed_y = nb.math("ADD", nb.math("MULTIPLY", along, 0.05), nb.math("MULTIPLY", r1, 9.0))
+    seed_z = nb.math("MULTIPLY", r2, 5.0)
+
+    # 节疤：板内随机一点，周围的年轮绕着它弯
+    kdx = nb.math("SUBTRACT", um, nb.math("MULTIPLY", nb.math("SUBTRACT", r2, 0.5), PLANK_W * 0.55))
+    kdy = nb.math("SUBTRACT", vm, nb.math("MULTIPLY", nb.map_range(r1, 0.0, 1.0, 0.2, 0.8), plen))
+    kd = nb.math("SQRT", nb.math("ADD", nb.math("MULTIPLY", kdx, kdx), nb.math("MULTIPLY", nb.math("MULTIPLY", kdy, kdy), 0.2)))
+    ksize = nb.map_range(t2, 0.0, 1.0, 0.006, 0.013)
+    kfield = nb.math("MULTIPLY", nb.math("EXPONENT", nb.math("MULTIPLY", nb.math("POWER", nb.math("DIVIDE", kd, nb.math("MULTIPLY", ksize, 3.5)), 2.0), -1.0)), knot_on)
+    kcore = nb.math("MULTIPLY", nb.map_range(kd, ksize, nb.math("MULTIPLY", ksize, 1.5), 1.0, 0.0, interp="SMOOTHSTEP"), knot_on)
+
+    # 弦切：年轮的等值线是沿板长展开的抛物线（教堂拱）
+    pith = nb.math("MULTIPLY", nb.math("SUBTRACT", r1, 0.5), PLANK_W * 0.9)
+    du2 = nb.math("SUBTRACT", um, pith)
+    q_p = nb.math("MULTIPLY", nb.math("MULTIPLY", du2, du2), nb.map_range(r2, 0.0, 1.0, 2.0, 6.0))
+    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", vm, nb.map_range(r0, 0.0, 1.0, -0.03, 0.03)))
+    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", kfield, 0.03))
+    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", r0, 0.37))
+    w_p = nb.new("ShaderNodeTexWave", Scale=78.0, Distortion=2.6, Detail=3.0, **{"Detail Scale": 1.4, "Detail Roughness": 0.55})
+    w_p.wave_type, w_p.bands_direction, w_p.wave_profile = "BANDS", "X", "SAW"
+    nb.set(w_p, "Vector", nb.combine(q_p, seed_y, seed_z))
+    # 径切：细密直纹
+    q_q = nb.math("ADD", um, nb.math("MULTIPLY", r0, 0.41))
+    w_q = nb.new("ShaderNodeTexWave", Scale=120.0, Distortion=1.3, Detail=2.0, **{"Detail Scale": 2.0})
+    w_q.wave_type, w_q.bands_direction = "BANDS", "X"
+    nb.set(w_q, "Vector", nb.combine(q_q, seed_y, seed_z))
+    # 共用：细直纹、棕眼、板内低频色斑
     gx = nb.math("ADD", x, nb.math("MULTIPLY", r0, 7.0))
-    gy = nb.math("ADD", nb.math("MULTIPLY", along, 0.05), nb.math("MULTIPLY", r1, 9.0))
-    gco = nb.combine(gx, gy, nb.math("MULTIPLY", r2, 5.0))
-    # 生长轮（较宽、扭曲大）
-    rings = nb.new("ShaderNodeTexWave", Scale=34.0, Distortion=5.0, Detail=3.0, **{"Detail Scale": 1.6, "Detail Roughness": 0.6})
-    rings.wave_type = "BANDS"
-    rings.bands_direction = "X"
-    rings.wave_profile = "SAW"
-    nb.set(rings, "Vector", gco)
-    # 细直纹
+    gco = nb.combine(gx, seed_y, seed_z)
     fine = nb.new("ShaderNodeTexWave", Scale=95.0, Distortion=2.0, Detail=2.0, **{"Detail Scale": 3.0})
-    fine.wave_type = "BANDS"
-    fine.bands_direction = "X"
+    fine.wave_type, fine.bands_direction = "BANDS", "X"
     nb.set(fine, "Vector", gco)
-    # 棕眼：沿纹理方向拉长的小黑点
-    pore_co = nb.combine(nb.math("MULTIPLY", gx, 520.0), nb.math("MULTIPLY", gy, 140.0), r2)
     pores = nb.new("ShaderNodeTexNoise", Scale=1.0, Detail=0.0)
-    nb.set(pores, "Vector", pore_co)
+    nb.set(pores, "Vector", nb.combine(nb.math("MULTIPLY", gx, 520.0), nb.math("MULTIPLY", seed_y, 140.0), r2))
     pore = nb.map_range(pores.outputs["Fac"], 0.62, 0.72, 0.0, 1.0)
-    # 板内低频色斑
     blotch = nb.new("ShaderNodeTexNoise", Scale=3.0, Detail=2.0)
     nb.set(blotch, "Vector", gco)
 
-    ring_v = nb.math("POWER", rings.outputs["Fac"], 1.7)
-    g = nb.math("ADD", nb.math("MULTIPLY", ring_v, 0.38), nb.math("MULTIPLY", fine.outputs["Fac"], 0.2))
+    g_p = nb.math("MULTIPLY", nb.math("POWER", w_p.outputs["Fac"], 1.6), 0.3)
+    g_q = nb.math("MULTIPLY", w_q.outputs["Fac"], 0.26)
+    g = nb.math("ADD", nb.math("MULTIPLY", g_p, plain), nb.math("MULTIPLY", g_q, nb.math("SUBTRACT", 1.0, plain)))
+    g = nb.math("ADD", g, nb.math("MULTIPLY", fine.outputs["Fac"], 0.16))
     g = nb.math("ADD", g, nb.math("MULTIPLY", blotch.outputs["Fac"], 0.45))
+    g = nb.math("ADD", g, nb.math("MULTIPLY", kfield, 0.35))
     g = nb.math("SUBTRACT", g, 0.12, clamp=True)
     wood = nb.ramp(g, [
         (0.00, srgb("#9c6a40")),
@@ -309,28 +353,36 @@ def mat_wood_floor(name="舞台木地板"):
         (0.65, srgb("#53301b")),
         (1.00, srgb("#2e180d")),
     ])
-    # 每块板：明度和冷暖都略有不同
-    tone = nb.map_range(r0, 0.0, 1.0, 0.68, 1.22)
+    # 每块板：明度、冷暖、偏灰都不一样
+    tone = nb.map_range(r0, 0.0, 1.0, 0.62, 1.25)
     wood = nb.mix(1.0, wood, nb.combine(tone, tone, tone), blend="MULTIPLY")
-    warmer = nb.map_range(r1, 0.0, 1.0, 0.0, 0.35)
-    wood = nb.mix(warmer, wood, srgb("#7a3a1c"), blend="OVERLAY")
+    wood = nb.mix(nb.map_range(r1, 0.0, 1.0, 0.0, 0.4), wood, srgb("#7a3a1c"), blend="OVERLAY")
+    wood = nb.mix(nb.map_range(r2, 0.0, 1.0, 0.0, 0.3), wood, srgb("#4a3a2c"), blend="COLOR")
+    # 边材：一侧发白的浅色带
+    side = nb.math("ADD", nb.math("MULTIPLY", nb.math("GREATER_THAN", t1, 0.5), u),
+                   nb.math("MULTIPLY", nb.math("LESS_THAN", t1, 0.5001), nb.math("SUBTRACT", 1.0, u)))
+    sap = nb.math("MULTIPLY", nb.math("LESS_THAN", t2, 0.15), nb.math("SUBTRACT", 1.0, smooth(side, 0.12, 0.42)))
+    wood = nb.mix(nb.math("MULTIPLY", sap, 0.55), wood, srgb("#b58a5e"))
+    wood = nb.mix(nb.math("MULTIPLY", kcore, 0.9), wood, srgb("#1f0f07"))
     wood = nb.mix(nb.math("MULTIPLY", pore, 0.55), wood, srgb("#1a0c05"))
     wood = nb.mix(nb.math("MULTIPLY", seam, 0.92), wood, srgb("#0b0604"))
 
-    # 粗糙度：清漆半哑光，带大块擦拭痕迹；板缝里粗糙
+    # 粗糙度：清漆半哑光，带大块擦拭痕迹；每块板光泽略有不同；板缝里粗糙
     smudge = nb.new("ShaderNodeTexNoise", Scale=0.9, Detail=5.0, Roughness=0.62)
     nb.set(smudge, "Vector", pos)
-    rough = nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.28, 0.5)
+    plank_r = nb.map_range(t0, 0.0, 1.0, -0.06, 0.06)
+    rough = nb.math("ADD", nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.28, 0.5), plank_r)
     rough = nb.math("ADD", rough, nb.math("MULTIPLY", pore, 0.15))
     rough = nb.math("MAXIMUM", rough, nb.math("MULTIPLY", seam, 0.9))
-    coat_r = nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.1, 0.24)
+    coat_r = nb.math("ADD", nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.1, 0.24), nb.math("MULTIPLY", plank_r, 0.8))
 
-    # 凹凸：板缝凹进、板边小倒角、每块板轻微不平（反光会一块块断开）
+    # 凹凸：板缝凹进、板边小倒角、每块板轻微不平、节疤略凹
     tilt = nb.math("MULTIPLY", nb.math("SUBTRACT", r2, 0.5), nb.math("SUBTRACT", u, 0.5))
-    cup = nb.math("MULTIPLY", nb.math("POWER", nb.math("SUBTRACT", u, 0.5), 2.0), -0.6)
+    cup = nb.math("MULTIPLY", nb.math("POWER", nb.math("SUBTRACT", u, 0.5), 2.0), nb.map_range(t2, 0.0, 1.0, -0.9, -0.2))
     h = nb.math("ADD", nb.math("MULTIPLY", bevel, -0.6), nb.math("MULTIPLY", tilt, 0.35))
     h = nb.math("ADD", h, cup)
     h = nb.math("ADD", h, nb.math("MULTIPLY", fine.outputs["Fac"], 0.04))
+    h = nb.math("SUBTRACT", h, nb.math("MULTIPLY", kcore, 0.15))
     bump = nb.new("ShaderNodeBump", Strength=1.0, Distance=0.0015)
     nb.set(bump, "Height", h)
     bump2 = nb.new("ShaderNodeBump", Strength=0.08, Distance=0.002)
@@ -403,42 +455,138 @@ def mat_apron(name="台口黑漆"):
 # 幕布几何
 # ----------------------------------------------------------------------------
 
-def pleat_field(xs, t, rng, period=(0.2, 0.34), amp=0.1, drift=0.7):
-    """幕布的褶：周期和深度沿宽度缓慢随机变化，越往下褶子越散开、越深。
+def _smooth_noise(rng, x0, x1, step):
+    """一维平滑随机函数：每隔 step 一个随机值，余弦插值。"""
+    kx = np.arange(x0 - 2 * step, x1 + 3 * step, step)
+    kv = rng.normal(0.0, 1.0, len(kx))
+    return lambda x: np.interp(x, kx, kv)
 
-    xs: (nc,) 横向坐标；t: (nr,) 0=底 1=顶。返回 (nr, nc) 的前后偏移。
+
+def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45):
+    """幕布的褶，一个一个“走”出来，而不是一条正弦波。
+
+    * 褶的宽度按对数正态随机，再除以一个“疏密场”：大部分地方松散，隔一段有一处堆叠区，
+      那里的褶又窄又挤、还更深；
+    * 每个褶脊 / 褶谷有自己的深度，并且沿高度慢慢变深变浅、左右漂移，看起来像褶在合并、分叉；
+    * 截面前圆后尖（朝观众的褶脊宽而圆，褶谷窄），每段还带随机歪斜；
+    * 顶部挂在杆上，褶子渐渐被拉整齐。
+    xs: (nc,) 横向坐标；t: (nr,) 0=底 1=顶。返回 (前后偏移 (nr,nc), 褶谷程度 0..1 (nr,nc))。
     """
-    kx = np.arange(xs[0] - 1.0, xs[-1] + 1.6, 0.55)
-    p = np.interp(xs, kx, rng.uniform(*period, len(kx)))
-    a = np.interp(xs, kx, rng.uniform(0.65, 1.2, len(kx))) * amp
-    d = np.interp(xs, kx, rng.normal(0.0, drift, len(kx)))
-    phase0 = np.cumsum(2 * math.pi * np.gradient(xs) / p) + rng.uniform(0, 2 * math.pi)
-    loose = (1.0 - t)[:, None] ** 1.5
-    phase = phase0[None, :] + d[None, :] * loose
-    depth = a[None, :] * (0.8 + 0.35 * loose)
-    # 两个谐波叠加，让褶的截面前圆后尖，不是死板的正弦
-    return depth * (0.74 * np.cos(phase) + 0.26 * np.cos(2 * phase + 0.9))
+    x0, x1 = xs[0] - 0.8, xs[-1] + 0.8
+    base = _smooth_noise(rng, x0, x1, 0.5)
+    n_b = max(1, int((x1 - x0) / bunch_every))
+    bc = rng.uniform(x0, x1, n_b)
+    ba = rng.uniform(0.7, 1.9, n_b)
+    bs = rng.uniform(0.1, 0.32, n_b)
+
+    def dens(x):
+        d = np.exp(0.38 * base(x))
+        d += (ba[None, :] * np.exp(-((np.atleast_1d(x)[:, None] - bc[None, :]) / bs[None, :]) ** 2)).sum(1)
+        return d
+
+    e = [x0]
+    while e[-1] < x1:
+        w = mean_w * math.exp(rng.normal(0.0, 0.38)) / float(dens(e[-1])[0])
+        e.append(e[-1] + min(max(w, 0.04), 0.7))
+    e = np.array(e)
+    n = len(e)
+    gaps = np.diff(e)
+    wavg = np.r_[gaps[0], (gaps[:-1] + gaps[1:]) / 2, gaps[-1]]
+    sign = np.where((np.arange(n) + rng.integers(2)) % 2 == 0, -1.0, 1.0)   # -1 朝观众的褶脊，+1 褶谷
+    dmag = depth * (wavg / mean_w) ** 0.75 * rng.uniform(0.45, 1.35, n) * dens(e) ** 0.45
+    dmag = np.minimum(dmag, wavg * 1.05)                  # 太窄的褶不能太深，否则网格会翻折
+    drift_i = rng.normal(0.0, drift, n) * wavg
+    f_i = rng.uniform(0.25, 1.5, n)
+    ph_i = rng.uniform(0.0, 2 * math.pi, n)
+    skew = rng.uniform(-0.45, 0.45, n)
+
+    nr, nc = len(t), len(xs)
+    Y = np.empty((nr, nc))
+    V = np.empty((nr, nc))
+    for r, tr in enumerate(t):
+        pos = e + drift_i * (1.0 - tr) ** 1.3
+        pos = pos[0] + np.r_[0.0, np.cumsum(np.maximum(np.diff(pos), 0.035))]
+        b = 0.5 * np.clip((tr - 0.8) / 0.2, 0, 1) ** 2
+        pos = pos * (1 - b) + np.linspace(pos[0], pos[-1], n) * b
+        env = np.clip(0.55 + 0.45 * np.sin(2 * math.pi * f_i * tr + ph_i), 0.12, 1.0)
+        amp = dmag * env * (1.0 + 0.4 * (1.0 - tr) ** 2) * (1.0 - 0.45 * b)
+        ey = sign * amp
+        i = np.clip(np.searchsorted(pos, xs) - 1, 0, n - 2)
+        s = np.clip((xs - pos[i]) / (pos[i + 1] - pos[i]), 0.0, 1.0)
+        s = s + skew[i] * s * (1.0 - s)
+        y = ey[i] + (ey[i + 1] - ey[i]) * (1.0 - np.cos(math.pi * s)) / 2
+        D = np.abs(ey[i]) * (1 - s) + np.abs(ey[i + 1]) * s + 1e-6
+        y = y - 0.22 * (D - y * y / D)                   # 前圆后尖
+        Y[r] = y
+        V[r] = np.clip(0.5 + 0.5 * y / D, 0.0, 1.0)
+    return Y, V
 
 
-def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, pool=0.14,
-                    period=(0.2, 0.34), amp=0.1, dx=0.016):
-    """一整幅垂到地面的幕：顶部挂在杆上，底部在台面上堆出一小截。"""
-    xs = np.arange(x0, x1 + dx * 0.5, dx)
-    # 底部加密，台面上堆起来的那一段和拐弯要圆滑
-    s = np.concatenate([np.linspace(-pool, 0.25, 30, endpoint=False),
-                        np.linspace(0.25, height, max(int(height / 0.07), 8))])
+def add_creases(Y, xs, s, rng, n, x_range, s_max, amp=(0.004, 0.016), s_min=0.0):
+    """细小折痕：几百条短的、大多接近竖直的细棱 / 细沟，越靠近底边越多、越斜。"""
+    for _ in range(n):
+        cx = rng.uniform(*x_range)
+        cs = s_min + (s_max - s_min) * rng.uniform() ** 1.7
+        theta = rng.normal(0.0, 0.22 if cs > 0.7 else 0.65)
+        L = rng.uniform(0.08, 0.7)
+        sig = rng.uniform(0.006, 0.024)
+        a = rng.uniform(*amp) * rng.choice((-1.0, 1.0))
+        hx = abs(math.sin(theta)) * L / 2 + 3 * sig
+        hs = abs(math.cos(theta)) * L / 2 + 3 * sig
+        ix = slice(*np.searchsorted(xs, (cx - hx, cx + hx)))
+        js = slice(*np.searchsorted(s, (cs - hs, cs + hs)))
+        dx = xs[ix][None, :] - cx
+        ds = s[js][:, None] - cs
+        along = dx * math.sin(theta) + ds * math.cos(theta)
+        perp = dx * math.cos(theta) - ds * math.sin(theta)
+        win = 0.5 * (1.0 + np.cos(math.pi * np.clip(2 * along / L, -1, 1)))
+        Y[js, ix] += a * np.exp(-(perp / sig) ** 2) * win
+    return Y
+
+
+def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, pool=0.24, mean_w=0.2, depth=0.1,
+                    fine=(-2.7, 2.7), dx_fine=0.008, dx=0.02, ds_fine=0.015, s_fine=3.4, ds=0.05, n_creases=0):
+    """一整幅垂到地面的幕：顶部挂在杆上，底部在台面上堆出长短不一、皱成一团的一截。
+
+    相机看得到的区域（fine × s_fine 以下）网格加密，细折痕只放在加密区里。
+    """
+    lo, hi = max(x0, fine[0]), min(x1, fine[1])
+    if lo < hi:
+        xs = np.unique(np.concatenate([np.arange(x0, lo, dx), np.arange(lo, hi, dx_fine), np.arange(hi, x1 + 1e-6, dx)]))
+    else:
+        xs = np.arange(x0, x1 + 1e-6, dx)
+    s = np.concatenate([np.linspace(-pool, 0.3, 46, endpoint=False),
+                        np.arange(0.3, min(s_fine, height), ds_fine),
+                        np.arange(min(s_fine, height), height + 1e-6, ds)])
     t = np.clip(s / height, 0.0, 1.0)
-    shift = np.interp(xs, np.arange(x0 - 1, x1 + 2, 0.4), rng.uniform(0.0, pool * 0.6, len(np.arange(x0 - 1, x1 + 2, 0.4))))
-    S = s[:, None] - shift[None, :]
-    r = 0.035
+    off, valley = fold_field(xs, t, rng, mean_w, depth)
+    if n_creases:
+        off = add_creases(off, xs, s, rng, n_creases, (lo, hi), s_fine)
+        # 少量粗一点的长折痕铺满整幅
+        off = add_creases(off, xs, s, rng, n_creases // 6, (x0, x1), height, amp=(0.006, 0.02))
+        # 堆在台面上的那一截：短而乱的褶
+        off = add_creases(off, xs, s, rng, n_creases // 2, (lo, hi), 0.12, amp=(0.006, 0.02), s_min=-pool)
+
+    # 台面上堆着的那一截：长短沿宽度随机，局部堆得更长
+    plen = np.clip(0.11 + 0.06 * _smooth_noise(rng, x0, x1, 0.35)(xs) + 0.05 * _smooth_noise(rng, x0, x1, 1.1)(xs), 0.03, pool)
+    S = s[:, None] - (pool - plen)[None, :]
+    r = 0.03
     Z = r * np.logaddexp(0.0, S / r) + 0.002            # softplus：在台面处圆滑地拐成水平
     fwd = Z - S                                          # 多出来的长度往台前铺
-    off = pleat_field(xs, t, rng, period, amp)
+    on_floor = np.clip(-S / 0.06, 0.0, 1.0)
+    kx, ks = rng.uniform(6, 40, 9), rng.uniform(8, 45, 9)
+    ph = rng.uniform(0, 2 * math.pi, 9)
+    lump = sum(np.sin(kx[k] * xs[None, :] + ks[k] * s[:, None] + ph[k]) for k in range(9)) / 3.5
+    pile = 0.5 + 0.5 * _smooth_noise(rng, x0, x1, 0.4)(xs)[None, :]        # 有的地方堆得高，有的地方几乎平铺
+    Z = Z + on_floor * 0.03 * np.clip(pile + 0.6 * lump, 0.0, None)   # 堆在地上皱成一团的起伏
+
     X = np.broadcast_to(xs[None, :], Z.shape)
     Y = y0 + off - fwd                                  # 台前方向是 -Y
     U = X - x0
     V = np.broadcast_to(s[:, None], Z.shape)
     me = grid_mesh(name, X, Y, Z, U, V)
+    attr = me.attributes.new("fold", "FLOAT", "POINT")   # 褶谷程度，材质里用来压暗褶子深处
+    attr.data.foreach_set("value", valley.ravel().astype(np.float32))
     me.materials.append(mat)
     ob = bpy.data.objects.new(name, me)
     return link(ob, coll)
@@ -455,11 +603,12 @@ def valance(name, rng, mat_v, mat_gold_, mat_fr, coll):
     zb = VALANCE_BOTTOM - sag
     t = np.linspace(0, 1, 48)
     Z = zb[None, :] + (VALANCE_TOP - zb)[None, :] * t[:, None]
-    off = pleat_field(xs, t, rng, (0.12, 0.2), 0.05, drift=0.4)
+    off, valley = fold_field(xs, t, rng, mean_w=0.15, depth=0.06, bunch_every=1.8, drift=0.3)
     bulge = -0.12 * np.sin(np.pi * np.clip(t * 1.1, 0, 1))[:, None] * np.sin(np.pi * k)[None, :]
     X = np.broadcast_to(xs[None, :], Z.shape)
     Y = PROSC_Y - 0.25 + off + bulge
     me = grid_mesh(name, X, Y, Z, X - x0, Z)
+    me.attributes.new("fold", "FLOAT", "POINT").data.foreach_set("value", valley.ravel().astype(np.float32))
     me.materials.append(mat_v)
     link(bpy.data.objects.new(name, me), coll)
 
@@ -696,12 +845,14 @@ def build(scene=None):
     floor = mat_wood_floor()
     black = mat_apron()
 
-    hanging_curtain("大幕", -CURTAIN_W / 2, CURTAIN_W / 2, CURTAIN_Y, CURTAIN_H, rng, velvet, c_curtain)
+    hanging_curtain("大幕", -CURTAIN_W / 2, CURTAIN_W / 2, CURTAIN_Y, CURTAIN_H, rng, velvet, c_curtain,
+                    depth=0.125, n_creases=900)
     for side in (-1, 1):
         x_in = side * PROSC_HALF
         x_out = side * (PROSC_HALF + 1.9)
         hanging_curtain("边幕_" + ("左" if side < 0 else "右"), min(x_in, x_out), max(x_in, x_out), PROSC_Y,
-                        VALANCE_TOP, rng, velvet, c_curtain, period=(0.18, 0.28), amp=0.08)
+                        VALANCE_TOP, rng, velvet, c_curtain, mean_w=0.17, depth=0.085,
+                        fine=(0, 0), dx=0.012, ds=0.04)
     valance("檐幕", rng, velvet, gold, fringe, c_curtain)
     build_floor(c_floor, floor, black, gold)
 
