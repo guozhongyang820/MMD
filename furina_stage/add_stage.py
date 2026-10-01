@@ -544,47 +544,82 @@ def add_creases(Y, xs, s, rng, n, x_range, s_max, amp=(0.004, 0.016), s_min=0.0)
     return Y
 
 
-def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, pool=0.24, mean_w=0.2, depth=0.1,
+def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=0.1,
                     fine=(-2.7, 2.7), dx_fine=0.008, dx=0.02, ds_fine=0.015, s_fine=3.4, ds=0.05, n_creases=0):
-    """一整幅垂到地面的幕：顶部挂在杆上，底部在台面上堆出长短不一、皱成一团的一截。
+    """一整幅垂到地面的幕：顶部挂在杆上，底部多出来的布“堆”在台面上。
 
-    相机看得到的区域（fine × s_fine 以下）网格加密，细折痕只放在加密区里。
+    底边的截面（从上往下）：竖直垂下 → 向前弯出一个鼓包 → 在最前面绕一个小圆弧折回 →
+    剩下的布平铺在鼓包下面往后藏。所以从台前看到的是圆润的折边（向前约 7–12 cm，处处不同），
+    看不到布的末端。相机看得到的区域（fine × s_fine 以下）网格加密，细折痕只放在加密区里。
     """
     lo, hi = max(x0, fine[0]), min(x1, fine[1])
     if lo < hi:
         xs = np.unique(np.concatenate([np.arange(x0, lo, dx), np.arange(lo, hi, dx_fine), np.arange(hi, x1 + 1e-6, dx)]))
     else:
         xs = np.arange(x0, x1 + 1e-6, dx)
-    s = np.concatenate([np.linspace(-pool, 0.3, 46, endpoint=False),
-                        np.arange(0.3, min(s_fine, height), ds_fine),
-                        np.arange(min(s_fine, height), height + 1e-6, ds)])
-    t = np.clip(s / height, 0.0, 1.0)
+    nc = len(xs)
+
+    # 每一处堆布的尺寸沿宽度缓慢变化：鼓包向前伸 Ry、高 Rz，折边圆弧半径 r，藏在下面的布长 tail
+    n1, n2 = _smooth_noise(rng, x0, x1, 0.3), _smooth_noise(rng, x0, x1, 0.9)
+    big = 0.5 * n1(xs) + 0.5 * n2(xs)
+    Ry = np.clip(0.065 + 0.022 * big, 0.03, 0.11)
+    Rz = np.clip(0.12 + 0.035 * _smooth_noise(rng, x0, x1, 0.45)(xs) + 0.4 * (Ry - 0.065), 0.07, 0.2)
+    r = np.clip(0.017 + 0.005 * _smooth_noise(rng, x0, x1, 0.25)(xs), 0.01, 0.026)
+    tail = Ry * rng.uniform(0.6, 1.0)
+    yn = -Ry                                             # 折边圆弧的圆心（相对 y0；台前是 -Y）
+
+    rows_y, rows_z = [], []
+    for a in np.linspace(1.0, 0.0, 6, endpoint=False):  # 末端：平铺在鼓包下面
+        rows_y.append(yn + tail * a)
+        rows_z.append(np.full(nc, 0.002))
+    for k in np.linspace(0.0, 1.0, 18, endpoint=False):  # 折边：小圆弧从地面绕到上层
+        b = math.radians(270.0 - 180.0 * k)
+        rows_y.append(yn + r * math.cos(b))
+        rows_z.append(0.002 + r + r * math.sin(b))
+    for al in np.linspace(90.0, 0.0, 16, endpoint=False):  # 鼓包：从折边上沿圆滑地弯回竖直
+        al = math.radians(al)
+        rows_y.append(-Ry + Ry * math.cos(al))
+        rows_z.append(0.002 + Rz - (Rz - 2 * r) * math.sin(al))
+    n_pile = len(rows_y)
+    zn = np.concatenate([np.arange(0.2, min(s_fine, height), ds_fine), np.arange(min(s_fine, height), height + 1e-6, ds)])
+    for z in zn:                                         # 竖直部分
+        rows_y.append(np.zeros(nc))
+        rows_z.append(Rz + 0.002 + (z - 0.2) * (height - Rz) / (height - 0.2))
+    BY = np.array([np.broadcast_to(v, (nc,)) for v in rows_y])
+    BZ = np.array([np.broadcast_to(v, (nc,)) for v in rows_z])
+
+    # 每列的弧长 → UV；各列平均 → 行参数 s（给褶子和折痕用）
+    seglen = np.hypot(np.diff(BY, axis=0), np.diff(BZ, axis=0))
+    S_col = np.vstack([np.zeros((1, nc)), np.cumsum(seglen, axis=0)])
+    s = S_col.mean(axis=1)
+    s_floor = s[n_pile]
+    t = np.clip((s - s_floor) / (height - s_floor), 0.0, 1.0)
     off, valley = fold_field(xs, t, rng, mean_w, depth)
+
+    # 折痕沿截面法线方向（竖直部分就是前后，鼓包上是斜的）
+    ty, tz = np.gradient(BY, axis=0), np.gradient(BZ, axis=0)
+    tn = np.hypot(ty, tz) + 1e-9
+    ny, nz = tz / tn, -ty / tn
+    C = np.zeros_like(BY)
     if n_creases:
-        off = add_creases(off, xs, s, rng, n_creases, (lo, hi), s_fine)
+        C = add_creases(C, xs, s, rng, n_creases, (lo, hi), s_fine)
         # 少量粗一点的长折痕铺满整幅
-        off = add_creases(off, xs, s, rng, n_creases // 6, (x0, x1), height, amp=(0.006, 0.02))
-        # 堆在台面上的那一截：短而乱的褶
-        off = add_creases(off, xs, s, rng, n_creases // 2, (lo, hi), 0.12, amp=(0.006, 0.02), s_min=-pool)
+        C = add_creases(C, xs, s, rng, n_creases // 6, (x0, x1), height, amp=(0.006, 0.02))
+        # 鼓包上：短而乱的皱
+        C = add_creases(C, xs, s, rng, n_creases // 2, (lo, hi), s_floor + 0.05, amp=(0.003, 0.009),
+                        s_min=s[6])
+    # 鼓包整体再揉一揉：低频起伏，局部鼓得高一些
+    kx, ks = rng.uniform(6, 30, 7), rng.uniform(8, 35, 7)
+    ph = rng.uniform(0, 2 * math.pi, 7)
+    lump = sum(np.sin(kx[k] * xs[None, :] + ks[k] * s[:, None] + ph[k]) for k in range(7)) / 3.0
+    on_pile = np.zeros_like(BY)
+    on_pile[6:n_pile] = np.sin(np.linspace(0, math.pi, n_pile - 6))[:, None]
+    C = C + on_pile * 0.008 * lump
 
-    # 台面上堆着的那一截：长短沿宽度随机，局部堆得更长
-    plen = np.clip(0.11 + 0.06 * _smooth_noise(rng, x0, x1, 0.35)(xs) + 0.05 * _smooth_noise(rng, x0, x1, 1.1)(xs), 0.03, pool)
-    S = s[:, None] - (pool - plen)[None, :]
-    r = 0.03
-    Z = r * np.logaddexp(0.0, S / r) + 0.002            # softplus：在台面处圆滑地拐成水平
-    fwd = Z - S                                          # 多出来的长度往台前铺
-    on_floor = np.clip(-S / 0.06, 0.0, 1.0)
-    kx, ks = rng.uniform(6, 40, 9), rng.uniform(8, 45, 9)
-    ph = rng.uniform(0, 2 * math.pi, 9)
-    lump = sum(np.sin(kx[k] * xs[None, :] + ks[k] * s[:, None] + ph[k]) for k in range(9)) / 3.5
-    pile = 0.5 + 0.5 * _smooth_noise(rng, x0, x1, 0.4)(xs)[None, :]        # 有的地方堆得高，有的地方几乎平铺
-    Z = Z + on_floor * 0.03 * np.clip(pile + 0.6 * lump, 0.0, None)   # 堆在地上皱成一团的起伏
-
+    Y = y0 + off + BY + ny * C
+    Z = BZ + nz * C
     X = np.broadcast_to(xs[None, :], Z.shape)
-    Y = y0 + off - fwd                                  # 台前方向是 -Y
-    U = X - x0
-    V = np.broadcast_to(s[:, None], Z.shape)
-    me = grid_mesh(name, X, Y, Z, U, V)
+    me = grid_mesh(name, X, Y, Z, X - x0, S_col)
     attr = me.attributes.new("fold", "FLOAT", "POINT")   # 褶谷程度，材质里用来压暗褶子深处
     attr.data.foreach_set("value", valley.ravel().astype(np.float32))
     me.materials.append(mat)
