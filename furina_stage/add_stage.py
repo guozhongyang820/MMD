@@ -48,8 +48,9 @@ STAGE_FRONT_Y = -3.4     # 台口前沿
 # bunch_* 堆叠区（每隔多少米一处、挤多紧），drift 褶沿高度左右漂移，wobble 褶沿高度变深变浅
 CURTAIN_DRAPE = dict(mean_w=0.12, depth=0.11, sigma=0.3, bunch_every=3.0, bunch_amp=(0.3, 0.9),
                      drift=0.06, wobble=0.18, n_creases=200, crease_amp=(0.0015, 0.005))
-# 大幕落地堆布：forward 向台前鼓出多远，height 鼓包多高，nose 最前面折边的圆弧半径，lumps 揉皱起伏（米）
-HEM_POOL = dict(forward=0.14, forward_var=0.045, height=0.17, height_var=0.04, nose=0.026, lumps=0.014)
+# 大幕落地堆布：forward 向台前摊出多远，height 在多高处开始弯下来，nose 最前面折边的圆弧半径，lumps 揉皱起伏（米）
+# ridge：褶脊比褶谷多流出去多少（0 = 一样，1 = 褶脊约是褶谷的 3 倍）
+HEM_POOL = dict(forward=0.15, forward_var=0.04, height=0.085, height_var=0.02, nose=0.02, lumps=0.01, ridge=1.0)
 PLANK_W = 0.15           # 地板条宽
 PLANK_L = 2.1            # 地板条长
 # 木纹公式的输入参数，每块板在基准值上随机浮动的比例（0.08 = ±8%）
@@ -555,15 +556,27 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
         xs = np.arange(x0, x1 + 1e-6, dx)
     nc = len(xs)
 
-    # 每一处堆布的尺寸沿宽度缓慢变化：鼓包向前伸 Ry、高 Rz，折边圆弧半径 r，藏在下面的布长 tail
-    n1, n2 = _smooth_noise(rng, x0, x1, 0.3), _smooth_noise(rng, x0, x1, 0.9)
-    big = 0.5 * n1(xs) + 0.5 * n2(xs)
+    # 落地堆布：鼓包向前伸 Ry、高 Rz，折边圆弧半径 r，藏在下面的布长 tail。
+    # 先按固定顺序取随机数（保持褶子布局不变），再算褶子，最后让堆布跟着褶子走
     h = HEM_POOL
-    Ry = np.clip(h["forward"] + h["forward_var"] * big, h["forward"] * 0.5, h["forward"] * 1.6)
-    Rz = np.clip(h["height"] + h["height_var"] * _smooth_noise(rng, x0, x1, 0.45)(xs) + 0.4 * (Ry - h["forward"]),
-                 h["height"] * 0.55, h["height"] * 1.6)
-    r = np.clip(h["nose"] * (1.0 + 0.3 * _smooth_noise(rng, x0, x1, 0.25)(xs)), h["nose"] * 0.6, h["nose"] * 1.5)
-    tail = Ry * rng.uniform(0.6, 1.0)
+    n1, n2 = _smooth_noise(rng, x0, x1, 0.3), _smooth_noise(rng, x0, x1, 0.9)
+    nz = _smooth_noise(rng, x0, x1, 0.45)
+    nr = _smooth_noise(rng, x0, x1, 0.25)
+    u_tail = rng.uniform(0.6, 1.0)
+    n_pile = 6 + 18 + 16
+    zn = np.concatenate([np.arange(0.2, min(s_fine, height), ds_fine), np.arange(min(s_fine, height), height + 1e-6, ds)])
+    t = np.clip(np.concatenate([np.zeros(n_pile), (zn - 0.2) / (height - 0.2)]), 0.0, 1.0)
+    off, valley = fold_field(xs, t, rng, mean_w, depth, **fold_kw)
+
+    # 褶脊（valley≈0，朝观众）的布“流”得更远、弯得更高，褶谷几乎不往前出 → 前沿是跟着褶子走的花边
+    ridge = 1.0 - valley[0]
+    big = 0.5 * n1(xs) + 0.5 * n2(xs)
+    k = h["ridge"]
+    Ry = np.clip((h["forward"] + h["forward_var"] * big) * (1.0 - k / 2 + k * ridge), 0.02, h["forward"] * 2.2)
+    r = np.clip(h["nose"] * (1.0 + 0.3 * nr(xs)) * (0.7 + 0.5 * ridge), h["nose"] * 0.5, h["nose"] * 1.6)
+    Rz = h["height"] * (0.7 + 0.6 * ridge) + h["height_var"] * nz(xs) + 0.25 * (Ry - h["forward"])
+    Rz = np.clip(Rz, 2 * r + 0.02, h["height"] * 2.0)
+    tail = Ry * u_tail
     yn = -Ry                                             # 折边圆弧的圆心（相对 y0；台前是 -Y）
 
     rows_y, rows_z = [], []
@@ -578,8 +591,7 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
         al = math.radians(al)
         rows_y.append(-Ry + Ry * math.cos(al))
         rows_z.append(0.002 + Rz - (Rz - 2 * r) * math.sin(al))
-    n_pile = len(rows_y)
-    zn = np.concatenate([np.arange(0.2, min(s_fine, height), ds_fine), np.arange(min(s_fine, height), height + 1e-6, ds)])
+    assert len(rows_y) == n_pile
     for z in zn:                                         # 竖直部分
         rows_y.append(np.zeros(nc))
         rows_z.append(Rz + 0.002 + (z - 0.2) * (height - Rz) / (height - 0.2))
@@ -591,8 +603,6 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
     S_col = np.vstack([np.zeros((1, nc)), np.cumsum(seglen, axis=0)])
     s = S_col.mean(axis=1)
     s_floor = s[n_pile]
-    t = np.clip((s - s_floor) / (height - s_floor), 0.0, 1.0)
-    off, valley = fold_field(xs, t, rng, mean_w, depth, **fold_kw)
 
     # 折痕沿截面法线方向（竖直部分就是前后，鼓包上是斜的）
     ty, tz = np.gradient(BY, axis=0), np.gradient(BZ, axis=0)
