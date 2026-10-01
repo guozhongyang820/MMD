@@ -25,6 +25,7 @@ from mathutils import Vector
 STAGE_COLL = "舞台背景"
 RECV_STAGE = "舞台_受光"
 RECV_CHAR = "角色_受光"
+RECV_FRAME = "檐幕边幕_受光"
 STAGE_WORLD = "舞台环境"
 STAGE_AMBIENT_NODE = "舞台_原环境光补偿"
 OVERVIEW_CAM = "舞台全景相机"
@@ -43,6 +44,15 @@ VALANCE_TOP = 6.8
 VALANCE_BOTTOM = 5.6
 STAGE_FRONT_Y = -3.4     # 台口前沿
 PLANK_W = 0.15           # 地板条宽
+PLANK_L = 2.1            # 地板条长
+# 木纹公式的输入参数，每块板在基准值上随机浮动的比例（0.08 = ±8%）
+WOOD_JITTER = {
+    "ring_scale": 0.08,       # 年轮疏密（基准 34）
+    "ring_distortion": 0.12,  # 年轮扭曲（基准 5.0）
+    "stretch": 0.10,          # 纹理沿板长的拉伸（基准 0.05）
+    "fine_scale": 0.06,       # 细直纹疏密（基准 95）
+    "ring_contrast": 0.10,    # 年轮深浅（基准 0.38）
+}
 
 
 # ----------------------------------------------------------------------------
@@ -253,12 +263,11 @@ def mat_velvet(name="酒红丝绒"):
 
 
 def mat_wood_floor(name="舞台木地板"):
-    """打蜡胡桃木长条地板，板和板之间尽量“不一样”：
+    """打蜡胡桃木长条地板：错缝铺设，板缝、木纹、棕眼、半哑光清漆。
 
-    * 每一列板的长度不同（0.9–2.8 m），错缝位置随机；
-    * 三种板：弦切板（教堂拱形花纹，约 60%）、径切板（细密直纹）、带节疤的弦切板（约 15%）；
-    * 约 15% 的板一侧带浅色边材；每块板的明度、冷暖、偏灰程度、清漆光泽都单独随机；
-    * 板缝、板边小倒角、每块板轻微不平（倒影会一块块断开）、棕眼、半哑光清漆上的擦拭痕迹。
+    所有板用同一个木纹公式，但每块板用自己的随机数把公式的输入参数轻微抖动
+    （年轮尺度、扭曲、纵向拉伸、细纹尺度、年轮对比，幅度见 WOOD_JITTER），
+    再加上随机的纹理偏移和一点色差，所以块块相似又块块不同。
     """
     mat = new_material(name)
     nb = Nodes(mat.node_tree)
@@ -267,85 +276,74 @@ def mat_wood_floor(name="舞台木地板"):
     nb.set(sep, 0, pos)
     x, y = sep.outputs[0], sep.outputs[1]
 
-    def rnd3(a, b, c):
-        n = nb.new("ShaderNodeTexWhiteNoise")
-        n.noise_dimensions = "3D"
-        nb.set(n, "Vector", nb.combine(a, b, c))
-        sc = nb.new("ShaderNodeSeparateColor")
-        nb.set(sc, 0, n.outputs["Color"])
-        return sc.outputs[0], sc.outputs[1], sc.outputs[2]
-
-    def smooth(v, a, b):
-        return nb.map_range(v, a, b, 0.0, 1.0, interp="SMOOTHSTEP")
-
-    # 板条编号：沿 X 是第几列；每列自己的板长和错缝，再算沿 Y 是第几段
+    # 板条编号：沿 X 是第几条，沿 Y 按每条随机错缝后是第几段
     xs = nb.math("DIVIDE", x, PLANK_W)
     col = nb.math("FLOOR", xs)
     u = nb.math("SUBTRACT", xs, col)
-    c0, c1, _ = rnd3(col, 3.7, 0.0)
-    plen = nb.map_range(c1, 0.0, 1.0, 0.9, 2.8)
-    along = nb.math("ADD", y, nb.math("MULTIPLY", c0, 3.0))
-    ys = nb.math("DIVIDE", along, plen)
+    stagger = nb.new("ShaderNodeTexWhiteNoise")
+    stagger.noise_dimensions = "2D"
+    nb.set(stagger, "Vector", nb.combine(col, 3.7))
+    along = nb.math("ADD", y, nb.math("MULTIPLY", stagger.outputs["Value"], PLANK_L))
+    ys = nb.math("DIVIDE", along, PLANK_L)
     seg = nb.math("FLOOR", ys)
     v = nb.math("SUBTRACT", ys, seg)
-    r0, r1, r2 = rnd3(col, seg, 1.3)
-    t0, t1, t2 = rnd3(col, seg, 7.9)
-    um = nb.math("MULTIPLY", nb.math("SUBTRACT", u, 0.5), PLANK_W)     # 板内横向（米，以板中线为 0）
-    vm = nb.math("MULTIPLY", v, plen)                                   # 板内纵向（米）
+    rid = nb.new("ShaderNodeTexWhiteNoise")
+    rid.noise_dimensions = "3D"
+    nb.set(rid, "Vector", nb.combine(col, seg, 1.3))
+    rsep = nb.new("ShaderNodeSeparateColor")
+    nb.set(rsep, 0, rid.outputs["Color"])
+    r0, r1, r2 = rsep.outputs[0], rsep.outputs[1], rsep.outputs[2]
+    # 第二组随机数：给木纹公式的参数做轻微抖动
+    jid = nb.new("ShaderNodeTexWhiteNoise")
+    jid.noise_dimensions = "3D"
+    nb.set(jid, "Vector", nb.combine(col, seg, 5.1))
+    jsep = nb.new("ShaderNodeSeparateColor")
+    nb.set(jsep, 0, jid.outputs["Color"])
+    j0, j1, j2 = jsep.outputs[0], jsep.outputs[1], jsep.outputs[2]
+
+    def jitter(base, key, rnd):
+        """base × (1 ± WOOD_JITTER[key])，每块板一个值。"""
+        a = WOOD_JITTER[key]
+        return nb.map_range(rnd, 0.0, 1.0, base * (1 - a), base * (1 + a))
 
     # 板缝：离板边的距离（米）
     du = nb.math("MULTIPLY", nb.math("MINIMUM", u, nb.math("SUBTRACT", 1.0, u)), PLANK_W)
-    dv = nb.math("MULTIPLY", nb.math("MINIMUM", v, nb.math("SUBTRACT", 1.0, v)), plen)
+    dv = nb.math("MULTIPLY", nb.math("MINIMUM", v, nb.math("SUBTRACT", 1.0, v)), PLANK_L)
     dist = nb.math("MINIMUM", du, nb.math("MULTIPLY", dv, 1.4))
     seam = nb.map_range(dist, 0.0004, 0.0016, 1.0, 0.0, interp="SMOOTHSTEP")
     bevel = nb.map_range(dist, 0.0004, 0.004, 1.0, 0.0, interp="SMOOTHSTEP")
 
-    plain = nb.math("LESS_THAN", t0, 0.62)                              # 弦切板
-    knot_on = nb.math("MULTIPLY", nb.math("LESS_THAN", t1, 0.24), plain)
-    seed_y = nb.math("ADD", nb.math("MULTIPLY", along, 0.05), nb.math("MULTIPLY", r1, 9.0))
-    seed_z = nb.math("MULTIPLY", r2, 5.0)
-
-    # 节疤：板内随机一点，周围的年轮绕着它弯
-    kdx = nb.math("SUBTRACT", um, nb.math("MULTIPLY", nb.math("SUBTRACT", r2, 0.5), PLANK_W * 0.55))
-    kdy = nb.math("SUBTRACT", vm, nb.math("MULTIPLY", nb.map_range(r1, 0.0, 1.0, 0.2, 0.8), plen))
-    kd = nb.math("SQRT", nb.math("ADD", nb.math("MULTIPLY", kdx, kdx), nb.math("MULTIPLY", nb.math("MULTIPLY", kdy, kdy), 0.2)))
-    ksize = nb.map_range(t2, 0.0, 1.0, 0.006, 0.013)
-    kfield = nb.math("MULTIPLY", nb.math("EXPONENT", nb.math("MULTIPLY", nb.math("POWER", nb.math("DIVIDE", kd, nb.math("MULTIPLY", ksize, 3.5)), 2.0), -1.0)), knot_on)
-    kcore = nb.math("MULTIPLY", nb.map_range(kd, ksize, nb.math("MULTIPLY", ksize, 1.5), 1.0, 0.0, interp="SMOOTHSTEP"), knot_on)
-
-    # 弦切：年轮的等值线是沿板长展开的抛物线（教堂拱）
-    pith = nb.math("MULTIPLY", nb.math("SUBTRACT", r1, 0.5), PLANK_W * 0.9)
-    du2 = nb.math("SUBTRACT", um, pith)
-    q_p = nb.math("MULTIPLY", nb.math("MULTIPLY", du2, du2), nb.map_range(r2, 0.0, 1.0, 2.0, 6.0))
-    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", vm, nb.map_range(r0, 0.0, 1.0, -0.03, 0.03)))
-    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", kfield, 0.03))
-    q_p = nb.math("ADD", q_p, nb.math("MULTIPLY", r0, 0.37))
-    w_p = nb.new("ShaderNodeTexWave", Scale=78.0, Distortion=2.6, Detail=3.0, **{"Detail Scale": 1.4, "Detail Roughness": 0.55})
-    w_p.wave_type, w_p.bands_direction, w_p.wave_profile = "BANDS", "X", "SAW"
-    nb.set(w_p, "Vector", nb.combine(q_p, seed_y, seed_z))
-    # 径切：细密直纹
-    q_q = nb.math("ADD", um, nb.math("MULTIPLY", r0, 0.41))
-    w_q = nb.new("ShaderNodeTexWave", Scale=120.0, Distortion=1.3, Detail=2.0, **{"Detail Scale": 2.0})
-    w_q.wave_type, w_q.bands_direction = "BANDS", "X"
-    nb.set(w_q, "Vector", nb.combine(q_q, seed_y, seed_z))
-    # 共用：细直纹、棕眼、板内低频色斑
+    # 木纹坐标：每块板随机平移，沿板长方向拉长
     gx = nb.math("ADD", x, nb.math("MULTIPLY", r0, 7.0))
-    gco = nb.combine(gx, seed_y, seed_z)
-    fine = nb.new("ShaderNodeTexWave", Scale=95.0, Distortion=2.0, Detail=2.0, **{"Detail Scale": 3.0})
-    fine.wave_type, fine.bands_direction = "BANDS", "X"
+    gy = nb.math("ADD", nb.math("MULTIPLY", along, jitter(0.05, "stretch", j2)), nb.math("MULTIPLY", r1, 9.0))
+    gco = nb.combine(gx, gy, nb.math("MULTIPLY", r2, 5.0))
+    # 生长轮（较宽、扭曲大）
+    rings = nb.new("ShaderNodeTexWave", Detail=3.0, **{"Detail Scale": 1.6, "Detail Roughness": 0.6})
+    nb.set(rings, "Scale", jitter(34.0, "ring_scale", j0))
+    nb.set(rings, "Distortion", jitter(5.0, "ring_distortion", j1))
+    rings.wave_type = "BANDS"
+    rings.bands_direction = "X"
+    rings.wave_profile = "SAW"
+    nb.set(rings, "Vector", gco)
+    # 细直纹
+    fine = nb.new("ShaderNodeTexWave", Distortion=2.0, Detail=2.0, **{"Detail Scale": 3.0})
+    nb.set(fine, "Scale", jitter(95.0, "fine_scale", nb.math("FRACT", nb.math("MULTIPLY", j0, 7.31))))
+    fine.wave_type = "BANDS"
+    fine.bands_direction = "X"
     nb.set(fine, "Vector", gco)
+    # 棕眼：沿纹理方向拉长的小黑点
+    pore_co = nb.combine(nb.math("MULTIPLY", gx, 520.0), nb.math("MULTIPLY", gy, 140.0), r2)
     pores = nb.new("ShaderNodeTexNoise", Scale=1.0, Detail=0.0)
-    nb.set(pores, "Vector", nb.combine(nb.math("MULTIPLY", gx, 520.0), nb.math("MULTIPLY", seed_y, 140.0), r2))
+    nb.set(pores, "Vector", pore_co)
     pore = nb.map_range(pores.outputs["Fac"], 0.62, 0.72, 0.0, 1.0)
+    # 板内低频色斑
     blotch = nb.new("ShaderNodeTexNoise", Scale=3.0, Detail=2.0)
     nb.set(blotch, "Vector", gco)
 
-    g_p = nb.math("MULTIPLY", nb.math("POWER", w_p.outputs["Fac"], 1.6), 0.3)
-    g_q = nb.math("MULTIPLY", w_q.outputs["Fac"], 0.26)
-    g = nb.math("ADD", nb.math("MULTIPLY", g_p, plain), nb.math("MULTIPLY", g_q, nb.math("SUBTRACT", 1.0, plain)))
-    g = nb.math("ADD", g, nb.math("MULTIPLY", fine.outputs["Fac"], 0.16))
+    ring_v = nb.math("POWER", rings.outputs["Fac"], 1.7)
+    g = nb.math("ADD", nb.math("MULTIPLY", ring_v, jitter(0.38, "ring_contrast", nb.math("FRACT", nb.math("MULTIPLY", j1, 5.17)))),
+                nb.math("MULTIPLY", fine.outputs["Fac"], 0.2))
     g = nb.math("ADD", g, nb.math("MULTIPLY", blotch.outputs["Fac"], 0.45))
-    g = nb.math("ADD", g, nb.math("MULTIPLY", kfield, 0.35))
     g = nb.math("SUBTRACT", g, 0.12, clamp=True)
     wood = nb.ramp(g, [
         (0.00, srgb("#9c6a40")),
@@ -353,36 +351,28 @@ def mat_wood_floor(name="舞台木地板"):
         (0.65, srgb("#53301b")),
         (1.00, srgb("#2e180d")),
     ])
-    # 每块板：明度、冷暖、偏灰都不一样
-    tone = nb.map_range(r0, 0.0, 1.0, 0.62, 1.25)
+    # 每块板：明度和冷暖都略有不同
+    tone = nb.map_range(r0, 0.0, 1.0, 0.68, 1.22)
     wood = nb.mix(1.0, wood, nb.combine(tone, tone, tone), blend="MULTIPLY")
-    wood = nb.mix(nb.map_range(r1, 0.0, 1.0, 0.0, 0.4), wood, srgb("#7a3a1c"), blend="OVERLAY")
-    wood = nb.mix(nb.map_range(r2, 0.0, 1.0, 0.0, 0.3), wood, srgb("#4a3a2c"), blend="COLOR")
-    # 边材：一侧发白的浅色带
-    side = nb.math("ADD", nb.math("MULTIPLY", nb.math("GREATER_THAN", t1, 0.5), u),
-                   nb.math("MULTIPLY", nb.math("LESS_THAN", t1, 0.5001), nb.math("SUBTRACT", 1.0, u)))
-    sap = nb.math("MULTIPLY", nb.math("LESS_THAN", t2, 0.15), nb.math("SUBTRACT", 1.0, smooth(side, 0.12, 0.42)))
-    wood = nb.mix(nb.math("MULTIPLY", sap, 0.55), wood, srgb("#b58a5e"))
-    wood = nb.mix(nb.math("MULTIPLY", kcore, 0.9), wood, srgb("#1f0f07"))
+    warmer = nb.map_range(r1, 0.0, 1.0, 0.0, 0.35)
+    wood = nb.mix(warmer, wood, srgb("#7a3a1c"), blend="OVERLAY")
     wood = nb.mix(nb.math("MULTIPLY", pore, 0.55), wood, srgb("#1a0c05"))
     wood = nb.mix(nb.math("MULTIPLY", seam, 0.92), wood, srgb("#0b0604"))
 
-    # 粗糙度：清漆半哑光，带大块擦拭痕迹；每块板光泽略有不同；板缝里粗糙
+    # 粗糙度：清漆半哑光，带大块擦拭痕迹；板缝里粗糙
     smudge = nb.new("ShaderNodeTexNoise", Scale=0.9, Detail=5.0, Roughness=0.62)
     nb.set(smudge, "Vector", pos)
-    plank_r = nb.map_range(t0, 0.0, 1.0, -0.06, 0.06)
-    rough = nb.math("ADD", nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.28, 0.5), plank_r)
+    rough = nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.28, 0.5)
     rough = nb.math("ADD", rough, nb.math("MULTIPLY", pore, 0.15))
     rough = nb.math("MAXIMUM", rough, nb.math("MULTIPLY", seam, 0.9))
-    coat_r = nb.math("ADD", nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.1, 0.24), nb.math("MULTIPLY", plank_r, 0.8))
+    coat_r = nb.map_range(smudge.outputs["Fac"], 0.3, 0.75, 0.1, 0.24)
 
-    # 凹凸：板缝凹进、板边小倒角、每块板轻微不平、节疤略凹
+    # 凹凸：板缝凹进、板边小倒角、每块板轻微不平（反光会一块块断开）
     tilt = nb.math("MULTIPLY", nb.math("SUBTRACT", r2, 0.5), nb.math("SUBTRACT", u, 0.5))
-    cup = nb.math("MULTIPLY", nb.math("POWER", nb.math("SUBTRACT", u, 0.5), 2.0), nb.map_range(t2, 0.0, 1.0, -0.9, -0.2))
+    cup = nb.math("MULTIPLY", nb.math("POWER", nb.math("SUBTRACT", u, 0.5), 2.0), -0.6)
     h = nb.math("ADD", nb.math("MULTIPLY", bevel, -0.6), nb.math("MULTIPLY", tilt, 0.35))
     h = nb.math("ADD", h, cup)
     h = nb.math("ADD", h, nb.math("MULTIPLY", fine.outputs["Fac"], 0.04))
-    h = nb.math("SUBTRACT", h, nb.math("MULTIPLY", kcore, 0.15))
     bump = nb.new("ShaderNodeBump", Strength=1.0, Distance=0.0015)
     nb.set(bump, "Height", h)
     bump2 = nb.new("ShaderNodeBump", Strength=0.08, Distance=0.002)
@@ -401,6 +391,7 @@ def mat_wood_floor(name="舞台木地板"):
     out = nb.new("ShaderNodeOutputMaterial")
     nb.links.new(bsdf.outputs[0], out.inputs["Surface"])
     return mat
+
 
 
 def mat_gold(name="旧金"):
@@ -734,18 +725,23 @@ def spot(name, coll, loc, target, energy, size_deg, blend, color, soft=0.2, recv
     return link(ob, coll)
 
 
-def build_lights(coll, recv_stage):
+def build_lights(coll, recv_stage, recv_frame):
     warm = (1.0, 0.78, 0.55)
     # 主追光：方向和人物的 Cel Key 一致，所以地上的影子和她身上的明暗是同一个方向
     spot("主追光", coll, (-3.6, -4.8, 7.2), (0.0, 0.0, 0.0), 3200, 36, 1.0, (1.0, 0.88, 0.74), 0.12, recv_stage)
     # 背幕光池：人物身后幕布上一团暖光，四周自然暗下去，把人和背景拉开
-    spot("背幕光池", coll, (0.4, -3.0, 6.5), (-0.1, CURTAIN_Y, 1.15), 4200, 22, 1.0, warm, 0.4, recv_stage)
+    # 挂在檐幕后上方（第一道灯杆的位置）；角度够陡，人物的影子落在地上而不是幕布上
+    spot("背幕光池", coll, (0.4, PROSC_Y + 0.3, 7.2), (-0.1, CURTAIN_Y, 0.85), 3600, 15, 1.0, warm, 0.4, recv_stage)
     # 侧掠光：从台侧贴着幕布打过去，突出褶子的明暗节奏
     spot("左侧掠光", coll, (-5.6, CURTAIN_Y - 1.4, 4.2), (1.5, CURTAIN_Y + 0.1, 1.2), 550, 30, 1.0, (1.0, 0.7, 0.48), 0.3, recv_stage)
     spot("右侧掠光", coll, (5.6, CURTAIN_Y - 1.6, 3.6), (-1.5, CURTAIN_Y + 0.1, 1.0), 260, 30, 1.0, (0.78, 0.74, 1.0), 0.3, recv_stage)
     # 顶光：只照幕布上半段和檐幕（相机里基本看不到，全景机位用）
     spot("顶排光", coll, (0.0, PROSC_Y + 0.6, 7.5), (0.0, CURTAIN_Y, 4.8), 300, 55, 1.0, warm, 1.0, recv_stage)
-    spot("檐幕光", coll, (0.0, -7.5, 4.0), (0.0, PROSC_Y, 6.0), 1400, 45, 0.8, warm, 1.0, recv_stage)
+    # 台口泛光：只照檐幕和两侧边幕（灯光链接到“檐幕边幕_受光”），全景机位里能看出台口的轮廓
+    spot("檐幕光", coll, (0.0, -8.5, 3.6), (0.0, PROSC_Y, 6.0), 1500, 85, 0.6, warm, 1.0, recv_frame)
+    for side, nm in ((-1, "左"), (1, "右")):
+        spot(nm + "边幕光", coll, (side * 2.5, -11.0, 5.0), (side * (PROSC_HALF + 0.9), PROSC_Y, 2.8),
+             2600, 34, 0.9, warm, 1.0, recv_frame)
 
 
 def build_haze(coll, density=0.012):
@@ -897,7 +893,9 @@ def build(scene=None):
     haze.hide_render = True                       # 默认关闭：想要光束感就在大纲里把它的渲染打开
     haze.hide_set(True)
     recv_stage = receiver_collection(RECV_STAGE, stage_objs)
-    build_lights(c_light, recv_stage)
+    frame_objs = [ob for ob in c_curtain.objects if ob.name.startswith(("边幕", "檐幕"))]
+    recv_frame = receiver_collection(RECV_FRAME, frame_objs)
+    build_lights(c_light, recv_stage, recv_frame)
 
     # 原有的人物灯只照人物
     chars = [bpy.data.objects[n] for n in CHARACTER_OBJECTS if n in bpy.data.objects]
