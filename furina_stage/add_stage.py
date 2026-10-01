@@ -26,6 +26,7 @@ STAGE_COLL = "舞台背景"
 RECV_STAGE = "舞台_受光"
 RECV_CHAR = "角色_受光"
 RECV_FRAME = "檐幕边幕_受光"
+RECV_BACK = "背幕_受光"
 STAGE_WORLD = "舞台环境"
 STAGE_AMBIENT_NODE = "舞台_原环境光补偿"
 OVERVIEW_CAM = "舞台全景相机"
@@ -43,6 +44,10 @@ PROSC_Y = -2.1
 VALANCE_TOP = 6.8
 VALANCE_BOTTOM = 5.6
 STAGE_FRONT_Y = -3.4     # 台口前沿
+# 大幕的褶：mean_w 褶脊到褶谷的平均距离，depth 褶深，sigma 宽窄的随机程度，
+# bunch_* 堆叠区（每隔多少米一处、挤多紧），drift 褶沿高度左右漂移，wobble 褶沿高度变深变浅
+CURTAIN_DRAPE = dict(mean_w=0.12, depth=0.11, sigma=0.3, bunch_every=3.0, bunch_amp=(0.3, 0.9),
+                     drift=0.06, wobble=0.18, n_creases=200, crease_amp=(0.0015, 0.005))
 PLANK_W = 0.15           # 地板条宽
 PLANK_L = 2.1            # 地板条长
 # 木纹公式的输入参数，每块板在基准值上随机浮动的比例（0.08 = ±8%）
@@ -219,27 +224,21 @@ def mat_velvet(name="酒红丝绒"):
     # 大块的绒面“倒毛”明暗（丝绒被摸过的那种色块）
     patch = nb.new("ShaderNodeTexNoise", Scale=0.45, Detail=2.0, Roughness=0.5)
     nb.set(patch, "Vector", uv)
-    patch_f = nb.map_range(patch.outputs["Fac"], 0.3, 0.7, 0.8, 1.14)
+    patch_f = nb.map_range(patch.outputs["Fac"], 0.3, 0.7, 0.86, 1.1)
     streak_f = nb.map_range(streak.outputs["Fac"], 0.25, 0.75, 0.9, 1.08)
 
     lw = nb.new("ShaderNodeLayerWeight", Blend=0.42)
     facing = nb.math("POWER", lw.outputs["Facing"], 1.6)
     core = srgb("#4f0815")      # 正对时：深酒红
-    rim = srgb("#901a34")       # 掠射时：绒光，偏玫红
+    rim = srgb("#a8203c")       # 掠射时：绒光，偏玫红
     base = nb.mix(facing, core, rim)
     base = nb.mix(1.0, base, nb.combine(patch_f, patch_f, patch_f), blend="MULTIPLY")
-    # 褶谷压暗（几何里存的 fold 属性：0 = 朝观众的褶脊，1 = 最深的褶谷）
+    # 褶谷轻微压暗（几何里存的 fold 属性：0 = 朝观众的褶脊，1 = 最深的褶谷）
     fold = nb.new("ShaderNodeAttribute")
     fold.attribute_type = "GEOMETRY"
     fold.attribute_name = "fold"
-    cav = nb.map_range(nb.math("POWER", fold.outputs["Fac"], 1.4), 0.0, 1.0, 1.08, 0.42)
+    cav = nb.map_range(nb.math("POWER", fold.outputs["Fac"], 1.6), 0.0, 1.0, 1.0, 0.65)
     base = nb.mix(1.0, base, nb.combine(cav, cav, cav), blend="MULTIPLY")
-    # “压绒”：绒毛倒向不同的小块，有的发亮有的发闷
-    crush = nb.new("ShaderNodeTexVoronoi", Scale=7.0, Randomness=1.0)
-    crush.feature = "F1"
-    nb.set(crush, "Vector", nb.vmath("ADD", uv, nb.vmath("SCALE", patch.outputs["Color"], scale=0.25)))
-    crush_f = nb.map_range(crush.outputs["Color"], 0.0, 1.0, 0.85, 1.12)
-    base = nb.mix(0.6, base, nb.combine(crush_f, crush_f, crush_f), blend="MULTIPLY")
     base = nb.mix(1.0, base, nb.combine(streak_f, streak_f, streak_f), blend="MULTIPLY")
 
     # 织物细节凹凸
@@ -260,6 +259,7 @@ def mat_velvet(name="酒红丝绒"):
     out = nb.new("ShaderNodeOutputMaterial")
     nb.links.new(bsdf.outputs[0], out.inputs["Surface"])
     return mat
+
 
 
 def mat_wood_floor(name="舞台木地板"):
@@ -453,12 +453,14 @@ def _smooth_noise(rng, x0, x1, step):
     return lambda x: np.interp(x, kx, kv)
 
 
-def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45):
+def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45,
+               sigma=0.38, wobble=0.9, bunch_amp=(0.7, 1.9)):
     """幕布的褶，一个一个“走”出来，而不是一条正弦波。
 
     * 褶的宽度按对数正态随机，再除以一个“疏密场”：大部分地方松散，隔一段有一处堆叠区，
       那里的褶又窄又挤、还更深；
-    * 每个褶脊 / 褶谷有自己的深度，并且沿高度慢慢变深变浅、左右漂移，看起来像褶在合并、分叉；
+    * 每个褶脊 / 褶谷有自己的深度，并且可以沿高度变深变浅（wobble）、左右漂移（drift）；
+      大幕用很小的 wobble / drift，保持厚丝绒笔直的垂坠；
     * 截面前圆后尖（朝观众的褶脊宽而圆，褶谷窄），每段还带随机歪斜；
     * 顶部挂在杆上，褶子渐渐被拉整齐。
     xs: (nc,) 横向坐标；t: (nr,) 0=底 1=顶。返回 (前后偏移 (nr,nc), 褶谷程度 0..1 (nr,nc))。
@@ -467,7 +469,7 @@ def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45):
     base = _smooth_noise(rng, x0, x1, 0.5)
     n_b = max(1, int((x1 - x0) / bunch_every))
     bc = rng.uniform(x0, x1, n_b)
-    ba = rng.uniform(0.7, 1.9, n_b)
+    ba = rng.uniform(*bunch_amp, n_b)
     bs = rng.uniform(0.1, 0.32, n_b)
 
     def dens(x):
@@ -477,7 +479,7 @@ def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45):
 
     e = [x0]
     while e[-1] < x1:
-        w = mean_w * math.exp(rng.normal(0.0, 0.38)) / float(dens(e[-1])[0])
+        w = mean_w * math.exp(rng.normal(0.0, sigma)) / float(dens(e[-1])[0])
         e.append(e[-1] + min(max(w, 0.04), 0.7))
     e = np.array(e)
     n = len(e)
@@ -499,7 +501,7 @@ def fold_field(xs, t, rng, mean_w=0.2, depth=0.1, bunch_every=2.4, drift=0.45):
         pos = pos[0] + np.r_[0.0, np.cumsum(np.maximum(np.diff(pos), 0.035))]
         b = 0.5 * np.clip((tr - 0.8) / 0.2, 0, 1) ** 2
         pos = pos * (1 - b) + np.linspace(pos[0], pos[-1], n) * b
-        env = np.clip(0.55 + 0.45 * np.sin(2 * math.pi * f_i * tr + ph_i), 0.12, 1.0)
+        env = np.clip(1.0 - wobble * (0.5 + 0.5 * np.sin(2 * math.pi * f_i * tr + ph_i)), 0.1, 1.0)
         amp = dmag * env * (1.0 + 0.4 * (1.0 - tr) ** 2) * (1.0 - 0.45 * b)
         ey = sign * amp
         i = np.clip(np.searchsorted(pos, xs) - 1, 0, n - 2)
@@ -536,7 +538,8 @@ def add_creases(Y, xs, s, rng, n, x_range, s_max, amp=(0.004, 0.016), s_min=0.0)
 
 
 def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=0.1,
-                    fine=(-2.7, 2.7), dx_fine=0.008, dx=0.02, ds_fine=0.015, s_fine=3.4, ds=0.05, n_creases=0):
+                    fine=(-2.7, 2.7), dx_fine=0.008, dx=0.02, ds_fine=0.015, s_fine=3.4, ds=0.05, n_creases=0,
+                    crease_amp=(0.004, 0.016), **fold_kw):
     """一整幅垂到地面的幕：顶部挂在杆上，底部多出来的布“堆”在台面上。
 
     底边的截面（从上往下）：竖直垂下 → 向前弯出一个鼓包 → 在最前面绕一个小圆弧折回 →
@@ -585,7 +588,7 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
     s = S_col.mean(axis=1)
     s_floor = s[n_pile]
     t = np.clip((s - s_floor) / (height - s_floor), 0.0, 1.0)
-    off, valley = fold_field(xs, t, rng, mean_w, depth)
+    off, valley = fold_field(xs, t, rng, mean_w, depth, **fold_kw)
 
     # 折痕沿截面法线方向（竖直部分就是前后，鼓包上是斜的）
     ty, tz = np.gradient(BY, axis=0), np.gradient(BZ, axis=0)
@@ -593,11 +596,11 @@ def hanging_curtain(name, x0, x1, y0, height, rng, mat, coll, mean_w=0.2, depth=
     ny, nz = tz / tn, -ty / tn
     C = np.zeros_like(BY)
     if n_creases:
-        C = add_creases(C, xs, s, rng, n_creases, (lo, hi), s_fine)
+        C = add_creases(C, xs, s, rng, n_creases, (lo, hi), s_fine, amp=crease_amp)
         # 少量粗一点的长折痕铺满整幅
-        C = add_creases(C, xs, s, rng, n_creases // 6, (x0, x1), height, amp=(0.006, 0.02))
+        C = add_creases(C, xs, s, rng, n_creases // 6, (x0, x1), height, amp=(crease_amp[0] * 1.5, crease_amp[1] * 1.2))
         # 鼓包上：短而乱的皱
-        C = add_creases(C, xs, s, rng, n_creases // 2, (lo, hi), s_floor + 0.05, amp=(0.003, 0.009),
+        C = add_creases(C, xs, s, rng, 450, (lo, hi), s_floor + 0.05, amp=(0.003, 0.009),
                         s_min=s[6])
     # 鼓包整体再揉一揉：低频起伏，局部鼓得高一些
     kx, ks = rng.uniform(6, 30, 7), rng.uniform(8, 35, 7)
@@ -725,13 +728,13 @@ def spot(name, coll, loc, target, energy, size_deg, blend, color, soft=0.2, recv
     return link(ob, coll)
 
 
-def build_lights(coll, recv_stage, recv_frame):
+def build_lights(coll, recv_stage, recv_frame, recv_back):
     warm = (1.0, 0.78, 0.55)
     # 主追光：方向和人物的 Cel Key 一致，所以地上的影子和她身上的明暗是同一个方向
     spot("主追光", coll, (-3.6, -4.8, 7.2), (0.0, 0.0, 0.0), 3200, 36, 1.0, (1.0, 0.88, 0.74), 0.12, recv_stage)
     # 背幕光池：人物身后幕布上一团暖光，四周自然暗下去，把人和背景拉开
-    # 挂在檐幕后上方（第一道灯杆的位置）；角度够陡，人物的影子落在地上而不是幕布上
-    spot("背幕光池", coll, (0.4, PROSC_Y + 0.3, 7.2), (-0.1, CURTAIN_Y, 0.85), 3600, 15, 1.0, warm, 0.4, recv_stage)
+    # 只照大幕和地板（灯光链接到“背幕_受光”）：灯离檐幕很近，不排除的话檐幕上会被打出一块热斑
+    spot("背幕光池", coll, (0.4, -3.0, 6.5), (-0.1, CURTAIN_Y, 1.15), 4200, 22, 1.0, warm, 0.4, recv_back)
     # 侧掠光：从台侧贴着幕布打过去，突出褶子的明暗节奏
     spot("左侧掠光", coll, (-5.6, CURTAIN_Y - 1.4, 4.2), (1.5, CURTAIN_Y + 0.1, 1.2), 550, 30, 1.0, (1.0, 0.7, 0.48), 0.3, recv_stage)
     spot("右侧掠光", coll, (5.6, CURTAIN_Y - 1.6, 3.6), (-1.5, CURTAIN_Y + 0.1, 1.0), 260, 30, 1.0, (0.78, 0.74, 1.0), 0.3, recv_stage)
@@ -876,13 +879,15 @@ def build(scene=None):
     floor = mat_wood_floor()
     black = mat_apron()
 
+    # 厚丝绒的垂坠：褶窄而深、从上到下笔直；不规律只体现在横向的宽窄、深浅和一两处温和的堆叠
     hanging_curtain("大幕", -CURTAIN_W / 2, CURTAIN_W / 2, CURTAIN_Y, CURTAIN_H, rng, velvet, c_curtain,
-                    depth=0.125, n_creases=900)
+                    **CURTAIN_DRAPE)
     for side in (-1, 1):
         x_in = side * PROSC_HALF
         x_out = side * (PROSC_HALF + 1.9)
         hanging_curtain("边幕_" + ("左" if side < 0 else "右"), min(x_in, x_out), max(x_in, x_out), PROSC_Y,
-                        VALANCE_TOP, rng, velvet, c_curtain, mean_w=0.17, depth=0.085,
+                        VALANCE_TOP, rng, velvet, c_curtain, mean_w=0.13, depth=0.085, drift=0.06, wobble=0.2,
+                        sigma=0.3, bunch_amp=(0.3, 0.9), bunch_every=3.0,
                         fine=(0, 0), dx=0.012, ds=0.04)
     valance("檐幕", rng, velvet, gold, fringe, c_curtain)
     build_floor(c_floor, floor, black, gold)
@@ -895,7 +900,8 @@ def build(scene=None):
     recv_stage = receiver_collection(RECV_STAGE, stage_objs)
     frame_objs = [ob for ob in c_curtain.objects if ob.name.startswith(("边幕", "檐幕"))]
     recv_frame = receiver_collection(RECV_FRAME, frame_objs)
-    build_lights(c_light, recv_stage, recv_frame)
+    recv_back = receiver_collection(RECV_BACK, [ob for ob in stage_objs if ob not in frame_objs])
+    build_lights(c_light, recv_stage, recv_frame, recv_back)
 
     # 原有的人物灯只照人物
     chars = [bpy.data.objects[n] for n in CHARACTER_OBJECTS if n in bpy.data.objects]
